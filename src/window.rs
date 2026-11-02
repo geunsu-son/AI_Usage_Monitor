@@ -1579,8 +1579,10 @@ const WIDGET_HEIGHT: i32 = 46;
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
     let divider_h = sc(25);
     let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
+    // Whole left gutter (divider + margin), not just the 3px stripe ? easier to grab.
+    let handle_w = sc(LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN);
     client_x >= 0
-        && client_x < sc(LEFT_DIVIDER_W)
+        && client_x < handle_w
         && client_y >= divider_top
         && client_y < divider_top + divider_h
 }
@@ -2087,25 +2089,25 @@ fn update_quota_tooltips() {
                 + sc(DIVIDER_RIGHT_MARGIN)
                 + label_width
                 + sc(LABEL_RIGHT_MARGIN);
-            for (id, visible, name, session, weekly) in [
+            for (service_id, visible, name, session, weekly) in [
                 (
-                    0,
+                    None,
                     s.show_claude_code,
                     "Claude Code",
                     &s.session_text,
                     &s.weekly_text,
                 ),
                 (
-                    1,
+                    Some(0),
                     s.show_codex,
                     "Codex",
                     &s.codex_session_text,
                     &s.codex_weekly_text,
                 ),
                 (
-                    2,
+                    Some(1),
                     s.show_cursor,
-                    "Antigravity",
+                    "Cursor",
                     &s.cursor_session_text,
                     &s.cursor_weekly_text,
                 ),
@@ -2113,21 +2115,36 @@ fn update_quota_tooltips() {
                 if !visible {
                     continue;
                 }
-                let description =
-                    s.monitor.services[id].description(SystemTime::now(), Instant::now(), chinese);
-                let mut text = format!("{name}\n{description}");
-                if s.monitor.services[id].error.is_some() && session == "!" {
-                    text.push_str(if chinese {
-                        "\n本服务本次未返回额度。"
+                let description = match service_id {
+                    Some(id) => s.monitor.services[id]
+                        .description(SystemTime::now(), Instant::now(), chinese),
+                    None => if chinese {
+                        "???".to_string()
                     } else {
-                        "\nThis provider did not return quota in the latest update."
-                    });
+                        "Not connected".to_string()
+                    },
+                };
+                let mut text = format!("{name}\n{description}");
+                if let Some(id) = service_id {
+                    if s.monitor.services[id].error.is_some() && session == "!" {
+                        text.push_str(if chinese {
+                            "\n???????????"
+                        } else {
+                            "\nThis provider did not return quota in the latest update."
+                        });
+                    }
                 }
-                if name == "Codex" && s.monitor.services[id].data.is_some() {
-                    for (missing, is_weekly) in [(session == "--", false), (weekly == "--", true)] {
-                        if missing {
-                            text.push('\n');
-                            text.push_str(quota_tooltip::message(chinese, is_weekly));
+                if name == "Codex" {
+                    if let Some(id) = service_id {
+                        if s.monitor.services[id].data.is_some() {
+                            for (missing, is_weekly) in
+                                [(session == "--", false), (weekly == "--", true)]
+                            {
+                                if missing {
+                                    text.push('\n');
+                                    text.push_str(quota_tooltip::message(chinese, is_weekly));
+                                }
+                            }
                         }
                     }
                 }
