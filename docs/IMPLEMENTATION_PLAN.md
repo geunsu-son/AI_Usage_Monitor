@@ -48,12 +48,13 @@ upstream 트리를 저장소 루트에 복사한 뒤 아래대로 고친다. Git
 | `src/recovery_events.rs` | 절전 복귀, 네트워크 복구 후 디바운스 새로고침 | 유지 |
 | `src/quota_text.rs` | 퍼센트 자리 고정 | 유지. 입력 문자열이 잔여율이 된다 |
 | `src/theme.rs`, `src/tray_icon.rs`, `src/localization/` | 테마와 트레이 아이콘, 한국어/영어 문자열 | 새 메뉴 문구를 추가한다. 다른 언어는 영어 문자열로 폴백해도 된다 |
-| `build.rs`, `src/icons/` | 실행 파일 아이콘 | 제품명을 AI Usage Monitor로 바꾼다. `src/icons/providers/`의 LobeHub MIT 고지를 유지한다. Claude 아이콘 파일은 삭제한다 |
+| `build.rs` | 실행 파일 버전 정보 | 제품명을 AI Usage Monitor로 바꾼다. 기존 저작권 문장은 notices로 옮기고 winres에는 우리 제품명만 남긴다 |
 
 ### 삭제한다
 
 - `src/updater.rs`와 업데이트 메뉴, winget 식별자
-- Claude, Antigravity 수집 함수와 메뉴, `src/icons/providers/claude.*`
+- Claude, Antigravity 수집 함수와 메뉴
+- `src/icons/providers/` 전체와 `src/icons/icon.ico`. 로고는 상표이고, 앱 아이콘은 우리 것으로 새로 만든다
 - `read_codex_credentials`, `codex_auth_path`, `CredReadW`로 Codex/Antigravity 자격 증명을 읽는 코드
 - `fetch_codex_usage`의 Bearer HTTP 호출. upstream은 토큰을 읽어 `CODEX_USAGE_URL`에 직접 붙인다. 그 경로 전체를 제거한다
 - 1분/1시간 주기 메뉴, 행별 표시 토글, 낮은 잔량 알림 메뉴, 언어 선택 메뉴, 외형 메뉴
@@ -369,12 +370,26 @@ Auto 사용 4% · API 사용 46%
 
 ## 라이선스
 
-구현 커밋에 아래를 포함한다.
+2026-11-02에 핀한 커밋의 `LICENSE`를 직접 확인했다. 세 참고 저장소 모두 표준 MIT이고, 비영리 한정이나 GPL 같은 추가 조건은 없다. MIT는 복사, 수정, 재배포를 허용한다. 조건은 해당 저작권 문구와 허가문 전체를 복사본에 남기는 것이다. 우리 저장소를 GitHub fork로 만들지 않아도 된다.
 
-- 루트 `LICENSE`: MIT. copyright 줄에 이 저장소 저작권과 함께 upstream이 이미 담고 있는 고지를 유지한다. upstream `LICENSE`는 Copyright (c) 2025 Craig Constable 이고, `Cargo.toml`의 winres 주석은 Code Zeno Pty Ltd와 Ray의 수정이다. 둘 다 `THIRD_PARTY_NOTICES.md`에 적는다.
-- CodexPeek에서 가져오는 세션/프로세스 코드가 있으면 Copyright (c) lch5518 / CodexPeek MIT를 그 파일 헤더와 `THIRD_PARTY_NOTICES.md`에 적는다.
-- `src/icons/providers/LICENSE`는 Copyright (c) 2023 LobeHub 다. OpenAI 마크를 Codex 열에 계속 쓰면 이 파일을 남긴다. 마크를 빼면 아이콘 파일도 함께 지운다.
-- Cursor 아이콘을 새로 그리지 않는다. MVP 열 제목은 텍스트 `Codex`, `Cursor`면 충분하다.
+| 가져오는 대상 | 확인한 고지 | 구현에서 |
+|---|---|---|
+| upstream-ray/codex-usage-monitor `26f47f4` | `LICENSE`: Copyright (c) 2025 Craig Constable | 파일 내용과 MIT 허가문을 그대로 둔다 |
+| 같은 트리의 Win32 버전 정보 | `Cargo.toml` winres: Original copyright (C) 2026 Code Zeno Pty Ltd; modifications (C) 2026 Ray. Comments에 Claude Code Usage Monitor 파생이라고 적혀 있다 | 이 문장을 `THIRD_PARTY_NOTICES.md`에 옮긴다. Craig Constable 고지를 이 문장으로 바꾸지 않는다 |
+| 상위 프로젝트 CodeZeno/Claude-Code-Usage-Monitor | 현재 `LICENSE`는 Copyright (C) 2026 Code Zeno Pty Ltd. v2.15.0에서 저작권자 표기만 바뀌었고 조건은 MIT 그대로다 | 부모 저장소의 최신 고지도 notices에 같이 적는다 |
+| CodexPeek `ff6e159` | `LICENSE`: Copyright (c) 2026 Codex Usage Monitor contributors | 세션/프로세스 코드를 넣는 파일 헤더와 notices에 이 문장 그대로 적는다. GitHub 아이디로 바꾸지 않는다 |
+| Lobe Icons 제공 로고 | `src/icons/providers/LICENSE`: Copyright (c) 2023 LobeHub. README는 브랜드 표장이 각 소유자에게 있다고 적는다 | 파일 자체를 가져오지 않는다 |
+| OpenTokenUsage | Copyright (c) 2026 Robin Ebers, Copyright (c) 2026 PowerUserZ | 코드를 복사하지 않으므로 우리 고지에 넣지 않는다. 나중에 소스를 붙이면 두 줄과 MIT 허가문을 추가한다 |
+
+구현 규칙:
+
+- 루트 `LICENSE`에는 우리 저작권 줄을 추가할 수 있다. 위에 있는 기존 저작권 줄과 MIT 허가문은 삭제하거나 요약하지 않는다.
+- `THIRD_PARTY_NOTICES.md`에 저장소 URL, 핀한 커밋, 위 저작권 문장, MIT 허가문 원문을 적는다.
+- portable exe를 배포할 때 `LICENSE`와 `THIRD_PARTY_NOTICES.md`를 exe와 같은 폴더에 둔다.
+- `src/icons/providers/`의 Claude, OpenAI 로고는 복사하지 않는다. 저작권은 MIT로 허용되지만, 그 파일은 상표 로고이고 MIT가 상표 사용을 허락하지는 않는다. 열 제목은 텍스트 `Codex`, `Cursor`로 둔다.
+- `src/icons/icon.ico`는 upstream이 직접 그린 C 마크다. MIT라 복사 자체는 가능하지만, 그 저장소 README는 자신들이 upstream이나 OpenAI의 승인을 받지 않았다고 밝힌다. 우리 트레이 아이콘은 새로 만든다.
+- OpenTokenUsage의 문서와 소스는 붙여 넣지 않는다. URL, 헤더 이름, JSON 필드명은 프로토콜 사실로만 참고한다.
+- Codex 공식 문서도 원문 그대로 저장소에 넣지 않는다.
 
 코드 서명은 MVP에 없다. README에 서명되지 않은 portable exe라고 적는다. GitHub Actions 릴리스 워크플로는 동작하는 exe와 테스트가 생긴 다음 커밋으로 미룬다.
 
