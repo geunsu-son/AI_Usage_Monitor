@@ -1,0 +1,59 @@
+[package]
+name = "ai-usage-monitor"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Codex and Cursor usage in the Windows taskbar"
+homepage = "https://github.com/geunsu-son/AI_Usage_Monitor"
+repository = "https://github.com/geunsu-son/AI_Usage_Monitor"
+
+[package.metadata.winres]
+CompanyName = "AI Usage Monitor"
+ProductName = "AI Usage Monitor"
+FileDescription = "Taskbar monitor for Codex and Cursor usage"
+OriginalFilename = "ai-usage-monitor.exe"
+InternalName = "AIUsageMonitor"
+LegalCopyright = "Copyright (C) 2026 geunsu-son"
+
+[dependencies]
+ureq = { version = "2", default-features = false, features = ["tls", "json", "proxy-from-env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+sha2 = "0.10"
+httpdate = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Power",
+    "Win32_Storage_FileSystem",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_Time",
+    "Win32_Security",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+]
+
+[build-dependencies]
+winres = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
