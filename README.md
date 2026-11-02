@@ -24,7 +24,7 @@ Results are appended to `%TEMP%\ai-usage-probe.txt`. Codex needs the OpenAI Code
 ## Usage
 
 - **Codex**: uses `codex app-server --stdio` (same approach as [CodexPeek](https://github.com/lch5518/CodexPeek)); sign in with the Codex CLI if prompted.
-- **Cursor**: off by default. Enable it from the tray menu after Cursor is installed and signed in. Reads `%APPDATA%\Cursor\User\globalStorage\state.vscdb` read-only and calls `api2.cursor.sh`.
+- **Cursor**: on by default when signed in. Toggle it from the tray **Models** menu. Reads `%APPDATA%\Cursor\User\globalStorage\state.vscdb` read-only and calls `api2.cursor.sh`. The widget shows **Auto** (included models) and **API** (external model) allowances; with only Cursor enabled, row labels use your locale (e.g. 자체 모델 / 외부 모델 in Korean).
 
 Settings and mutex names use the `AIUsageMonitor` prefix so this app can run beside the upstream Codex-only monitor.
 

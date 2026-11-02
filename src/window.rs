@@ -148,7 +148,7 @@ const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
 const IDM_LANG_SIMPLIFIED_CHINESE: u16 = 51;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
-const IDM_MODEL_ANTIGRAVITY: u16 = 62;
+const IDM_MODEL_CURSOR: u16 = 62;
 const IDM_SHOW_SESSION_WINDOW: u16 = 71;
 const IDM_SHOW_WEEKLY_WINDOW: u16 = 72;
 const IDM_ALERT_OFF: u16 = 80;
@@ -477,7 +477,7 @@ impl Default for SettingsFile {
             widget_visible: true,
             show_claude_code: false,
             show_codex: true,
-            show_cursor: false,
+            show_cursor: true,
             show_session_window: true,
             show_weekly_window: true,
             alert_threshold_percent: 0,
@@ -507,7 +507,7 @@ fn default_show_codex() -> bool {
 }
 
 fn default_show_cursor() -> bool {
-    false
+    true
 }
 
 fn default_show_usage_window() -> bool {
@@ -640,13 +640,15 @@ fn service_tooltip(
     weekly_text: &str,
     show_session_window: bool,
     show_weekly_window: bool,
+    session_label: &str,
+    weekly_label: &str,
 ) -> String {
     let mut parts = Vec::new();
     if show_session_window {
-        parts.push(format!("5h {session_text}"));
+        parts.push(format!("{session_label} {session_text}"));
     }
     if show_weekly_window {
-        parts.push(format!("7d {weekly_text}"));
+        parts.push(format!("{weekly_label} {weekly_text}"));
     }
     format!("{service}: {}", parts.join(" | "))
 }
@@ -691,6 +693,8 @@ fn collect_low_quota_alerts(state: &mut AppState, data: &AppUsageData) -> Vec<Qu
                 strings.codex_model,
                 usage,
                 strings,
+                strings.session_window,
+                strings.weekly_window,
             );
         }
     }
@@ -706,6 +710,8 @@ fn collect_low_quota_alerts(state: &mut AppState, data: &AppUsageData) -> Vec<Qu
                 strings.cursor_model,
                 usage,
                 strings,
+                strings.cursor_auto_model,
+                strings.cursor_api_model,
             );
         }
     }
@@ -722,7 +728,9 @@ fn append_provider_alerts(
     provider_key: &str,
     provider_label: &str,
     usage: &crate::models::UsageData,
-    strings: Strings,
+    _strings: Strings,
+    session_label: &'static str,
+    weekly_label: &'static str,
 ) {
     append_quota_alert(
         alerts,
@@ -733,7 +741,7 @@ fn append_provider_alerts(
         provider_key,
         provider_label,
         "session",
-        strings.session_window,
+        session_label,
         &usage.session,
     );
     append_quota_alert(
@@ -745,7 +753,7 @@ fn append_provider_alerts(
         provider_key,
         provider_label,
         "weekly",
-        strings.weekly_window,
+        weekly_label,
         &usage.weekly,
     );
 }
@@ -815,6 +823,8 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
                     &s.weekly_text,
                     s.show_session_window,
                     s.show_weekly_window,
+                    strings.session_window,
+                    strings.weekly_window,
                 ));
             }
             if s.show_codex {
@@ -824,6 +834,8 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
                     &s.codex_weekly_text,
                     s.show_session_window,
                     s.show_weekly_window,
+                    strings.session_window,
+                    strings.weekly_window,
                 ));
             }
             if s.show_cursor {
@@ -833,6 +845,8 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
                     &s.cursor_weekly_text,
                     s.show_session_window,
                     s.show_weekly_window,
+                    strings.cursor_auto_model,
+                    strings.cursor_api_model,
                 ));
             }
             Some(tray_icon::TrayIconData {
@@ -1129,7 +1143,11 @@ fn refresh_usage_texts(state: &mut AppState) {
                 strings,
                 poller::UsageWindowKind::Session,
             );
-            state.cursor_weekly_text = poller::format_cursor_renewal_line(&cursor.weekly);
+            state.cursor_weekly_text = poller::format_line(
+                &cursor.weekly,
+                strings,
+                poller::UsageWindowKind::Weekly,
+            );
         }
     } else if state.show_cursor {
         let label = state.monitor.services[1]
@@ -1633,6 +1651,18 @@ fn active_model_count(show_codex: bool, show_cursor: bool) -> i32 {
     (show_codex as i32 + show_cursor as i32).max(1)
 }
 
+fn quota_row_labels(
+    strings: Strings,
+    show_codex: bool,
+    show_cursor: bool,
+) -> (&'static str, &'static str) {
+    if show_cursor && !show_codex {
+        (strings.cursor_auto_model, strings.cursor_api_model)
+    } else {
+        (strings.session_window, strings.weekly_window)
+    }
+}
+
 fn row_bar_segment_count(active_models: i32) -> i32 {
     match active_models {
         1 => SEGMENT_COUNT,
@@ -1644,7 +1674,12 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
 /// Labels and reset texts that can occupy the widest space in each column.
 fn usage_layout_samples(language: LanguageId) -> (Vec<&'static str>, Vec<String>) {
     let strings = language.strings();
-    let labels = vec![strings.session_window, strings.weekly_window];
+    let labels = vec![
+        strings.session_window,
+        strings.weekly_window,
+        strings.cursor_auto_model,
+        strings.cursor_api_model,
+    ];
     let resets = if language == LanguageId::SimplifiedChinese {
         vec!["23:59重置 *".to_string(), "12/31重置 *".to_string()]
     } else {
@@ -2545,6 +2580,8 @@ fn paint_content(
             provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Codex);
         }
 
+        let (row1_label, row2_label) = quota_row_labels(strings, show_codex, show_cursor);
+
         if show_session_window {
             draw_row(
                 hdc,
@@ -2557,7 +2594,7 @@ fn paint_content(
                 is_dark,
                 appearance,
                 text_color,
-                strings.session_window,
+                row1_label,
                 session_pct,
                 session_text,
                 codex_session_pct,
@@ -2587,7 +2624,7 @@ fn paint_content(
                 is_dark,
                 appearance,
                 text_color,
-                strings.weekly_window,
+                row2_label,
                 weekly_pct,
                 weekly_text,
                 codex_weekly_pct,
@@ -3619,7 +3656,7 @@ unsafe extern "system" fn wnd_proc(
                     }
                     save_state_settings();
                 }
-                IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
+                IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_CURSOR => {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
@@ -3638,7 +3675,7 @@ unsafe extern "system" fn wnd_proc(
                                         s.show_codex = !s.show_codex;
                                     }
                                 }
-                                IDM_MODEL_ANTIGRAVITY => {
+                                IDM_MODEL_CURSOR => {
                                     if s.show_claude_code || s.show_codex || !s.show_cursor {
                                         s.show_cursor = !s.show_cursor;
                                     }
@@ -3914,7 +3951,7 @@ fn show_context_menu(hwnd: HWND) {
         let _ = AppendMenuW(
             models_menu,
             cursor_flags,
-            IDM_MODEL_ANTIGRAVITY as usize,
+            IDM_MODEL_CURSOR as usize,
             PCWSTR::from_raw(cursor_model.as_ptr()),
         );
 
@@ -4781,12 +4818,14 @@ mod tests {
                 "剩余13% 19:04重置",
                 "剩余86% 07/18重置",
                 true,
-                true
+                true,
+                "5h",
+                "7d",
             ),
             "Codex: 5h 剩余13% 19:04重置 | 7d 剩余86% 07/18重置"
         );
         assert_eq!(
-            service_tooltip("Claude Code", "13%", "86%", false, true),
+            service_tooltip("Claude Code", "13%", "86%", false, true, "5h", "7d"),
             "Claude Code: 7d 86%"
         );
     }

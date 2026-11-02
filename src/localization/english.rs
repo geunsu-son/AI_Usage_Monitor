@@ -14,6 +14,8 @@ pub(super) const STRINGS: Strings = Strings {
     claude_code_model: "Claude Code",
     codex_model: "Codex",
     cursor_model: "Cursor",
+    cursor_auto_model: "Auto",
+    cursor_api_model: "API",
     settings: "Settings",
     start_with_windows: "Start with Windows",
     reset_position: "Reset Position",

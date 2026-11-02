@@ -98,14 +98,20 @@ fn map_ureq_error(error: ureq::Error) -> CursorError {
     CursorError::Unavailable
 }
 
-pub fn parse_period_usage(value: &serde_json::Value) -> UsageSnapshot {
-    let plan = value.get("planUsage");
-    let used = plan
-        .and_then(|p| p.get("totalPercentUsed"))
+fn parse_used_percent(plan: Option<&serde_json::Value>, key: &str) -> Option<f32> {
+    plan.and_then(|p| p.get(key))
         .and_then(|v| v.as_f64())
         .map(|v| v as f32)
-        .filter(|v| v.is_finite() && (0.0..=100.0).contains(v));
-    let used = used.or_else(|| {
+        .filter(|v| v.is_finite() && (0.0..=100.0).contains(v))
+}
+
+pub fn parse_period_usage(value: &serde_json::Value) -> UsageSnapshot {
+    let plan = value.get("planUsage");
+    let cycle_end = value.get("billingCycleEnd").and_then(parse_billing_cycle_end);
+
+    let auto_raw = parse_used_percent(plan, "autoPercentUsed");
+    let api = parse_used_percent(plan, "apiPercentUsed");
+    let total = parse_used_percent(plan, "totalPercentUsed").or_else(|| {
         let limit = plan?.get("limit")?.as_f64()? as f32;
         let remaining = plan?.get("remaining")?.as_f64()? as f32;
         if limit > 0.0 && remaining >= 0.0 {
@@ -114,54 +120,46 @@ pub fn parse_period_usage(value: &serde_json::Value) -> UsageSnapshot {
             None
         }
     });
+    let mut auto = auto_raw;
+    if auto.is_none() {
+        auto = total;
+    }
 
-    let cycle_end = value.get("billingCycleEnd").and_then(parse_billing_cycle_end);
-
-    let auto = plan
-        .and_then(|p| p.get("autoPercentUsed"))
-        .and_then(|v| v.as_f64())
-        .map(|v| v as f32)
-        .filter(|v| v.is_finite());
-    let api = plan
-        .and_then(|p| p.get("apiPercentUsed"))
-        .and_then(|v| v.as_f64())
-        .map(|v| v as f32)
-        .filter(|v| v.is_finite());
-
-    let status = if used.is_some() {
+    let has_data = auto.is_some() || api.is_some();
+    let status = if has_data {
         ConnectionStatus::Ok
     } else {
         ConnectionStatus::Unavailable
     };
 
-    let monthly = QuotaWindow {
-        label: "월간".to_string(),
-        used_percent: used,
-        remaining_percent: used.and_then(remaining_percent),
+    let auto_window = QuotaWindow {
+        label: "auto".to_string(),
+        used_percent: auto,
+        remaining_percent: auto.and_then(remaining_percent),
         resets_at: cycle_end,
     };
-    let renewal = QuotaWindow {
-        label: "갱신".to_string(),
-        used_percent: None,
-        remaining_percent: None,
+    let api_window = QuotaWindow {
+        label: "api".to_string(),
+        used_percent: api,
+        remaining_percent: api.and_then(remaining_percent),
         resets_at: cycle_end,
     };
 
     UsageSnapshot {
         provider: ProviderId::Cursor,
-        quotas: vec![monthly, renewal],
+        quotas: vec![auto_window, api_window],
         status,
         fetched_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
             .map(|d| d.as_secs() as i64),
-        error_category: if used.is_some() {
+        error_category: if has_data {
             None
         } else {
             Some("unavailable".to_string())
         },
         details: ProviderDetails {
-            auto_percent_used: auto,
+            auto_percent_used: auto_raw,
             api_percent_used: api,
         },
     }
@@ -182,7 +180,10 @@ mod tests {
             "planUsage": {"totalPercentUsed": 29.0, "autoPercentUsed": 1.0, "apiPercentUsed": 46.0}
         });
         let snap = parse_period_usage(&json);
-        assert_eq!(snap.quotas[0].remaining_percent, Some(71.0));
+        assert_eq!(snap.quotas[0].used_percent, Some(1.0));
+        assert_eq!(snap.quotas[0].remaining_percent, Some(99.0));
+        assert_eq!(snap.quotas[1].used_percent, Some(46.0));
+        assert_eq!(snap.quotas[1].remaining_percent, Some(54.0));
         assert_eq!(snap.quotas[0].resets_at, Some(1771077734));
     }
 

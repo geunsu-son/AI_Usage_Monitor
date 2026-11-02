@@ -115,16 +115,6 @@ pub fn format_remaining_only(section: &UsageSection) -> String {
     format!("{:.0}%", remaining_percentage(section.percentage))
 }
 
-pub fn format_cursor_renewal_line(section: &UsageSection) -> String {
-    let reset = section
-        .resets_at
-        .and_then(native_interop::system_time_to_local);
-    match reset {
-        Some(t) => format!("갱신 {:02}/{:02}", t.wMonth, t.wDay),
-        None => "--".to_string(),
-    }
-}
-
 pub fn remaining_percentage(used_percentage: f64) -> f64 {
     (100.0 - used_percentage).clamp(0.0, 100.0)
 }
