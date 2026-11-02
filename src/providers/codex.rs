@@ -124,9 +124,43 @@ impl CodexError {
     }
 }
 
+fn known_codex_install_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        paths.push(
+            std::path::PathBuf::from(&local)
+                .join("OpenAI")
+                .join("Codex")
+                .join("bin")
+                .join("codex.exe"),
+        );
+    }
+    if let Ok(roaming) = std::env::var("APPDATA") {
+        paths.push(
+            std::path::PathBuf::from(&roaming)
+                .join("npm")
+                .join("codex.cmd"),
+        );
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        paths.push(
+            std::path::PathBuf::from(&pf)
+                .join("OpenAI")
+                .join("Codex")
+                .join("codex.exe"),
+        );
+    }
+    paths
+}
+
 fn locate_codex_cli() -> Result<std::path::PathBuf, CodexError> {
     use std::path::PathBuf;
     let mut candidates = Vec::new();
+    for path in known_codex_install_paths() {
+        if path.is_file() {
+            candidates.push(path);
+        }
+    }
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
             for name in ["codex.exe", "codex.cmd", "codex.ps1"] {
@@ -169,10 +203,35 @@ fn locate_codex_cli() -> Result<std::path::PathBuf, CodexError> {
     deduped.into_iter().next().ok_or(CodexError::CliMissing)
 }
 
+#[cfg(test)]
+mod locate_tests {
+    use super::*;
+
+    #[test]
+    fn finds_codex_under_local_appdata_openai() {
+        let Some(local) = std::env::var("LOCALAPPDATA").ok().map(std::path::PathBuf::from) else {
+            return;
+        };
+        let expected = local
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin")
+            .join("codex.exe");
+        if !expected.is_file() {
+            return;
+        }
+        let resolved = locate_codex_cli().expect("codex should resolve when installed");
+        assert_eq!(
+            resolved.canonicalize().unwrap_or(resolved.clone()),
+            expected.canonicalize().unwrap_or(expected)
+        );
+    }
+}
+
 fn run_app_server_session(program: &std::path::Path) -> Result<UsageSnapshot, CodexError> {
     let deadline = Instant::now() + SESSION_TIMEOUT;
     let mut cmd = Command::new(program);
-    cmd.args(["app-server", "--stdio"])
+    cmd.args(["app-server"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());

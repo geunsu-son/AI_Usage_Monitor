@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod cli;
 mod diagnose;
 mod localization;
 mod model;
@@ -41,6 +42,10 @@ fn main() {
                 let _ = error;
             }
         }
+    }
+
+    if let Some(exit_code) = cli::handle_probe_args(&args) {
+        std::process::exit(exit_code);
     }
 
     if let Some(exit_code) = updater::handle_cli_mode(&args) {

@@ -16,8 +16,7 @@ InternalName = "AIUsageMonitor"
 LegalCopyright = "Copyright (C) 2026 geunsu-son"
 
 [dependencies]
-ureq = { version = "2", default-features = false, features = ["native-tls", "json", "proxy-from-env"] }
-native-tls = "0.2"
+ureq = { version = "2", default-features = false, features = ["tls", "json", "proxy-from-env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
@@ -42,6 +41,7 @@ features = [
     "Win32_UI_Controls",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_System_Console",
     "Win32_System_Time",
     "Win32_Security",
     "Win32_UI_Input_KeyboardAndMouse",

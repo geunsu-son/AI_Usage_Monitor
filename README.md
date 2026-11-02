@@ -12,6 +12,15 @@ cargo build --release
 
 The binary is `target\release\ai-usage-monitor.exe`.
 
+### Verify providers (no GUI)
+
+```powershell
+cargo build
+.\target\debug\ai-usage-monitor.exe --probe all
+```
+
+Results are appended to `%TEMP%\ai-usage-probe.txt`. Codex needs the OpenAI Codex CLI installed (typically under `%LOCALAPPDATA%\OpenAI\Codex\bin\codex.exe`). Cursor needs the desktop app signed in.
+
 ## Usage
 
 - **Codex**: uses `codex app-server --stdio` (same approach as [CodexPeek](https://github.com/lch5518/CodexPeek)); sign in with the Codex CLI if prompted.

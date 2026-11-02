@@ -78,7 +78,10 @@ fn post_usage(token: &str) -> Result<serde_json::Value, CursorError> {
         .set("Connect-Protocol-Version", "1")
         .send_string("{}")
         .map_err(map_ureq_error)?;
-    response.into_json().map_err(|_| CursorError::Unavailable)
+    let text = response
+        .into_string()
+        .map_err(|_| CursorError::Unavailable)?;
+    serde_json::from_str(&text).map_err(|_| CursorError::Unavailable)
 }
 
 fn map_ureq_error(error: ureq::Error) -> CursorError {
@@ -190,5 +193,15 @@ mod tests {
         });
         let snap = parse_period_usage(&json);
         assert!(snap.quotas[0].used_percent.unwrap() > 58.0);
+    }
+
+    #[test]
+    #[ignore]
+    fn live_fetch_cursor() {
+        let result = fetch_cursor();
+        assert!(
+            result.is_ok(),
+            "cursor live probe failed: {result:?} (enable Cursor login and TLS)"
+        );
     }
 }
