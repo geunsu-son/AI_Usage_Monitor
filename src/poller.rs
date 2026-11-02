@@ -111,6 +111,10 @@ pub fn format_line(
     }
 }
 
+pub fn format_remaining_only(section: &UsageSection) -> String {
+    format!("{:.0}%", remaining_percentage(section.percentage))
+}
+
 pub fn format_cursor_renewal_line(section: &UsageSection) -> String {
     let reset = section
         .resets_at

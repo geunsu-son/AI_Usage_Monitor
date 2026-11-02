@@ -19,6 +19,11 @@ fn percent_width(font_px: i32) -> i32 {
     cell(DIGIT_CELL, font_px) * 3 + cell(PERCENT_CELL, font_px)
 }
 
+/// Width of the percentage column without reset/countdown text.
+pub fn percent_column_width(font_px: i32) -> i32 {
+    percent_width(font_px)
+}
+
 /// Logical offset of the reset column from the start of the quota text.
 pub fn reset_offset(font_px: i32) -> i32 {
     percent_width(font_px) + COLUMN_GAP

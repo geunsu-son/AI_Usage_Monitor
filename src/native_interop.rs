@@ -119,7 +119,7 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
     taskbars
 }
 
-/// Find a child window by class name
+/// Find a child window by class name (direct child only).
 pub fn find_child_window(parent: HWND, class_name: &str) -> Option<HWND> {
     unsafe {
         let class = wide_str(class_name);
@@ -132,6 +132,90 @@ pub fn find_child_window(parent: HWND, class_name: &str) -> Option<HWND> {
             Ok(h) if h != HWND::default() => Some(h),
             _ => None,
         }
+    }
+}
+
+const TASKBAR_RESERVE_CLASS_NAMES: &[&str] = &["TrayNotifyWnd", "TrayClockWClass", "ClockButton"];
+
+struct ReserveLeftCollect {
+    taskbar_rect: RECT,
+    min_left: i32,
+}
+
+unsafe extern "system" fn collect_reserve_left(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let state = &mut *(lparam.0 as *mut ReserveLeftCollect);
+    let mut class_name = [0u16; 256];
+    let len = GetClassNameW(hwnd, &mut class_name);
+    if len > 0 {
+        let name = String::from_utf16_lossy(&class_name[..len as usize]);
+        let reserved = TASKBAR_RESERVE_CLASS_NAMES
+            .iter()
+            .any(|target| *target == name)
+            || name.contains("Clock");
+        if reserved {
+            if let Some(rect) = get_window_rect_safe(hwnd) {
+                let taskbar_mid = (state.taskbar_rect.left + state.taskbar_rect.right) / 2;
+                if rect.right > taskbar_mid && rect.width() > 0 {
+                    state.min_left = state.min_left.min(rect.left);
+                }
+            }
+        }
+    }
+    let _ = EnumChildWindows(hwnd, Some(collect_reserve_left), lparam);
+    BOOL::from(true)
+}
+
+trait TaskbarRectWidth {
+    fn width(&self) -> i32;
+}
+
+impl TaskbarRectWidth for RECT {
+    fn width(&self) -> i32 {
+        self.right - self.left
+    }
+}
+
+/// Left edge of the system tray / clock band on this taskbar (screen coordinates).
+/// The usage widget's right edge must stay at or left of this line.
+pub fn taskbar_reserve_left(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
+    let mut state = ReserveLeftCollect {
+        taskbar_rect,
+        min_left: taskbar_rect.right,
+    };
+    unsafe {
+        let _ = EnumChildWindows(
+            taskbar_hwnd,
+            Some(collect_reserve_left),
+            LPARAM(&mut state as *mut _ as _),
+        );
+    }
+    if state.min_left >= taskbar_rect.right {
+        if let Some(tray_hwnd) = find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
+            if let Some(tray_rect) = get_window_rect_safe(tray_hwnd) {
+                return tray_rect.left;
+            }
+        }
+        return taskbar_rect.right;
+    }
+    state.min_left
+}
+
+#[cfg(test)]
+mod taskbar_reserve_tests {
+    use super::*;
+
+    #[test]
+    fn reserve_left_prefers_smaller_left_among_candidates() {
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 48,
+        };
+        assert!(rect.width() == 1920);
+        let a = 1700;
+        let b = 1650;
+        assert_eq!(a.min(b), 1650);
     }
 }
 

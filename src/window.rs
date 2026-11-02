@@ -106,6 +106,8 @@ struct AppState {
     drag_start_offset: i32,
 
     widget_visible: bool,
+    /// When true, draw only "NN%" (no reset countdown) to stay left of the clock.
+    usage_text_compact: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -989,19 +991,37 @@ fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)>
         })
 }
 
-fn tray_left_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
-    let mut tray_left = taskbar_rect.right;
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
+fn taskbar_widget_reserve_left(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
+    native_interop::taskbar_reserve_left(taskbar_hwnd, taskbar_rect) - sc(TASKBAR_RESERVE_MARGIN)
+}
+
+fn sync_usage_text_compact(taskbar_hwnd: HWND, taskbar_rect: RECT) -> bool {
+    let reserve = taskbar_widget_reserve_left(taskbar_hwnd, taskbar_rect);
+    let available = (reserve - taskbar_rect.left).max(0);
+    let mut state = lock_state();
+    let Some(s) = state.as_mut() else {
+        return false;
+    };
+    let want_compact = {
+        let full = total_widget_width_for(
+            active_model_count(s.show_codex, s.show_cursor),
+            s.language,
+            s.appearance,
+            false,
+        );
+        full > available
+    };
+    if s.usage_text_compact == want_compact {
+        return false;
     }
-    tray_left
+    s.usage_text_compact = want_compact;
+    refresh_usage_texts(s);
+    true
 }
 
 fn clamp_offset_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT, offset: i32) -> i32 {
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
-    let max_offset = (tray_left - taskbar_rect.left - total_widget_width()).max(0);
+    let reserve = taskbar_widget_reserve_left(taskbar_hwnd, taskbar_rect);
+    let max_offset = (reserve - taskbar_rect.left - total_widget_width()).max(0);
     offset.clamp(0, max_offset)
 }
 
@@ -1011,9 +1031,9 @@ fn offset_for_drop_point(
     pt: POINT,
     drag_start_client_x: i32,
 ) -> i32 {
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
+    let reserve = taskbar_widget_reserve_left(taskbar_hwnd, taskbar_rect);
     let desired_left = pt.x - taskbar_rect.left - drag_start_client_x;
-    let offset = tray_left - taskbar_rect.left - total_widget_width() - desired_left;
+    let offset = reserve - taskbar_rect.left - total_widget_width() - desired_left;
     clamp_offset_for_taskbar(taskbar_hwnd, taskbar_rect, offset)
 }
 
@@ -1073,18 +1093,23 @@ fn refresh_usage_texts(state: &mut AppState) {
     };
 
     if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_codex_line(
-            &codex.session,
-            strings,
-            false,
-            poller::UsageWindowKind::Session,
-        );
-        state.codex_weekly_text = poller::format_codex_line(
-            &codex.weekly,
-            strings,
-            false,
-            poller::UsageWindowKind::Weekly,
-        );
+        if state.usage_text_compact {
+            state.codex_session_text = poller::format_remaining_only(&codex.session);
+            state.codex_weekly_text = poller::format_remaining_only(&codex.weekly);
+        } else {
+            state.codex_session_text = poller::format_codex_line(
+                &codex.session,
+                strings,
+                false,
+                poller::UsageWindowKind::Session,
+            );
+            state.codex_weekly_text = poller::format_codex_line(
+                &codex.weekly,
+                strings,
+                false,
+                poller::UsageWindowKind::Weekly,
+            );
+        }
     } else if state.show_codex {
         let label = state.monitor.services[0]
             .error
@@ -1095,12 +1120,17 @@ fn refresh_usage_texts(state: &mut AppState) {
     }
 
     if let Some(cursor) = data.cursor.as_ref() {
-        state.cursor_session_text = poller::format_line(
-            &cursor.session,
-            strings,
-            poller::UsageWindowKind::Session,
-        );
-        state.cursor_weekly_text = poller::format_cursor_renewal_line(&cursor.weekly);
+        if state.usage_text_compact {
+            state.cursor_session_text = poller::format_remaining_only(&cursor.session);
+            state.cursor_weekly_text = poller::format_remaining_only(&cursor.weekly);
+        } else {
+            state.cursor_session_text = poller::format_line(
+                &cursor.session,
+                strings,
+                poller::UsageWindowKind::Session,
+            );
+            state.cursor_weekly_text = poller::format_cursor_renewal_line(&cursor.weekly);
+        }
     } else if state.show_cursor {
         let label = state.monitor.services[1]
             .error
@@ -1575,6 +1605,8 @@ const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 138;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
+/// Extra gap between widget right edge and system clock / tray.
+const TASKBAR_RESERVE_MARGIN: i32 = 16;
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
     let divider_h = sc(25);
@@ -1656,7 +1688,7 @@ unsafe fn create_widget_font(appearance: Appearance) -> HFONT {
 
 /// Label and quota-text column widths in physical pixels, measured with the
 /// fonts used for drawing so larger text and longer translations still fit.
-fn usage_layout_widths(language: LanguageId, appearance: Appearance) -> (i32, i32) {
+fn usage_layout_widths(language: LanguageId, appearance: Appearance, compact: bool) -> (i32, i32) {
     let reset_x = sc(quota_text::reset_offset(appearance.font_px()));
     let fallback = if language == LanguageId::SimplifiedChinese {
         (
@@ -1669,6 +1701,12 @@ fn usage_layout_widths(language: LanguageId, appearance: Appearance) -> (i32, i3
     unsafe {
         let hdc = GetDC(HWND::default());
         if hdc.is_invalid() {
+            if compact {
+                return (
+                    fallback.0,
+                    sc(quota_text::percent_column_width(appearance.font_px())) + sc(3),
+                );
+            }
             return fallback;
         }
         let measure = |font: HFONT, values: &mut dyn Iterator<Item = &str>| {
@@ -1704,6 +1742,12 @@ fn usage_layout_widths(language: LanguageId, appearance: Appearance) -> (i32, i3
             )
         };
         ReleaseDC(HWND::default(), hdc);
+        if compact {
+            return (
+                widths.0,
+                sc(quota_text::percent_column_width(appearance.font_px())) + sc(3),
+            );
+        }
         widths
     }
 }
@@ -1712,9 +1756,14 @@ fn usage_percent_for_display(_language: LanguageId, used_percentage: f64) -> f64
     poller::remaining_percentage(used_percentage)
 }
 
-fn total_widget_width_for(active_models: i32, language: LanguageId, appearance: Appearance) -> i32 {
+fn total_widget_width_for(
+    active_models: i32,
+    language: LanguageId,
+    appearance: Appearance,
+    compact: bool,
+) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
-    let (label_width, text_width) = usage_layout_widths(language, appearance);
+    let (label_width, text_width) = usage_layout_widths(language, appearance, compact);
     let model_width = model_usage_width(bar_segments, text_width);
 
     sc(LEFT_DIVIDER_W)
@@ -1728,17 +1777,15 @@ fn total_widget_width_for(active_models: i32, language: LanguageId, appearance: 
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
     total_widget_width_for(
-        active_model_count(
-            state.show_codex,
-            state.show_cursor,
-        ),
+        active_model_count(state.show_codex, state.show_cursor),
         state.language,
         state.appearance,
+        state.usage_text_compact,
     )
 }
 
 fn total_widget_width() -> i32 {
-    let (active_models, language, appearance) = {
+    let (active_models, language, appearance, compact) = {
         let state = lock_state();
         state
             .as_ref()
@@ -1747,11 +1794,12 @@ fn total_widget_width() -> i32 {
                     active_model_count(s.show_codex, s.show_cursor),
                     s.language,
                     s.appearance,
+                    s.usage_text_compact,
                 )
             })
-            .unwrap_or((1, LanguageId::English, Appearance::default()))
+            .unwrap_or((1, LanguageId::English, Appearance::default(), false))
     };
-    total_widget_width_for(active_models, language, appearance)
+    total_widget_width_for(active_models, language, appearance, compact)
 }
 
 fn claude_accent_color() -> Color {
@@ -1899,7 +1947,7 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count, language, settings.appearance),
+            total_widget_width_for(initial_model_count, language, settings.appearance, false),
             sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -1984,6 +2032,7 @@ pub fn run() {
                 drag_start_client_x: 0,
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
+                usage_text_compact: false,
             });
         }
 
@@ -2083,7 +2132,7 @@ fn update_quota_tooltips() {
         if !s.dragging {
             let chinese = s.language == LanguageId::SimplifiedChinese;
             let count = active_model_count(s.show_codex, s.show_cursor);
-            let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
+            let (label_width, text_width) = usage_layout_widths(s.language, s.appearance, s.usage_text_compact);
             let width = model_usage_width(row_bar_segment_count(count), text_width);
             let mut left = sc(LEFT_DIVIDER_W)
                 + sc(DIVIDER_RIGHT_MARGIN)
@@ -2408,7 +2457,14 @@ fn paint_content(
         let codex_weekly_pct = usage_percent_for_display(language, codex_weekly_pct);
         let cursor_session_pct = usage_percent_for_display(language, cursor_session_pct);
         let cursor_weekly_pct = usage_percent_for_display(language, cursor_weekly_pct);
-        let (label_width, text_width) = usage_layout_widths(language, appearance);
+        let (label_width, text_width) = usage_layout_widths(
+            language,
+            appearance,
+            lock_state()
+                .as_ref()
+                .map(|s| s.usage_text_compact)
+                .unwrap_or(false),
+        );
 
         let client_rect = RECT {
             left: 0,
@@ -2845,8 +2901,6 @@ fn tray_reposition_is_suppressed() -> bool {
 
 fn position_at_taskbar() {
     refresh_dpi();
-    // Drop the app-state lock before any Win32 call that may synchronously
-    // re-enter our window procedure.
     let (hwnd, embedded, tray_offset, anchor_left, taskbar_hwnd) = {
         let state = lock_state();
         let s = match state.as_ref() {
@@ -2884,19 +2938,14 @@ fn position_at_taskbar() {
         }
     };
 
+    let compact_changed = sync_usage_text_compact(taskbar_hwnd, taskbar_rect);
+
     let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-    let mut tray_left = taskbar_rect.right;
+    let reserve_left = taskbar_widget_reserve_left(taskbar_hwnd, taskbar_rect);
     let anchor_top = taskbar_rect.top;
     let anchor_height = taskbar_height;
-
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
-    }
-
     let widget_width = total_widget_width();
-    let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
+    let max_offset = (reserve_left - taskbar_rect.left - widget_width).max(0);
     let tray_offset = tray_offset.clamp(0, max_offset);
     let offset_changed = {
         let mut state = lock_state();
@@ -2921,7 +2970,7 @@ fn position_at_taskbar() {
         // Child window: coordinates relative to parent (taskbar)
         let x = compute_anchor_x(
             taskbar_rect.left,
-            tray_left,
+            reserve_left,
             widget_width,
             tray_offset,
             anchor_left,
@@ -2935,7 +2984,7 @@ fn position_at_taskbar() {
         // Topmost popup: screen coordinates
         let x = compute_anchor_x(
             taskbar_rect.left,
-            tray_left,
+            reserve_left,
             widget_width,
             tray_offset,
             anchor_left,
@@ -2944,6 +2993,9 @@ fn position_at_taskbar() {
         diagnose::log(format!(
             "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
         ));
+    }
+    if compact_changed {
+        render_layered();
     }
 }
 
@@ -3216,18 +3268,11 @@ unsafe extern "system" fn wnd_proc(
                     // Clamp: don't go past left edge of taskbar
                     if let Some(taskbar_hwnd) = taskbar_hwnd {
                         if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
-                            let mut tray_left = taskbar_rect.right;
-                            if let Some(tray_hwnd) =
-                                native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
-                            {
-                                if let Some(tray_rect) =
-                                    native_interop::get_window_rect_safe(tray_hwnd)
-                                {
-                                    tray_left = tray_rect.left;
-                                }
-                            }
+                            let reserve_left =
+                                taskbar_widget_reserve_left(taskbar_hwnd, taskbar_rect);
                             let widget_width = total_widget_width_for_state(s);
-                            let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
+                            let max_offset =
+                                (reserve_left - taskbar_rect.left - widget_width).max(0);
                             if new_offset > max_offset {
                                 new_offset = max_offset;
                             }
@@ -3240,9 +3285,9 @@ unsafe extern "system" fn wnd_proc(
                             let widget_height = sc(WIDGET_HEIGHT).min(taskbar_height);
                             let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
                             let x = if embedded {
-                                tray_left - taskbar_rect.left - widget_width - new_offset
+                                reserve_left - taskbar_rect.left - widget_width - new_offset
                             } else {
-                                tray_left - widget_width - new_offset
+                                reserve_left - widget_width - new_offset
                             };
                             Some((
                                 hwnd_val,
@@ -4703,7 +4748,7 @@ mod tests {
                         font_size,
                         ..Appearance::default()
                     };
-                    let (label_width, text_width) = usage_layout_widths(language, appearance);
+                    let (label_width, text_width) = usage_layout_widths(language, appearance, false);
                     let reset_width =
                         text_width - sc(quota_text::reset_offset(appearance.font_px()));
                     let label_font = create_widget_font(appearance);
