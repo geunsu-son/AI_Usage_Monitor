@@ -8,7 +8,11 @@ use windows::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, HFONT, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::BST_CHECKED;
+use windows::Win32::UI::Controls::{
+    InitCommonControlsEx, BST_CHECKED, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, NMHDR, TCIF_TEXT,
+    TCITEMW, TCM_GETCURSEL, TCM_GETITEMCOUNT, TCM_INSERTITEMW, TCM_SETCURSEL, TCM_SETITEMW,
+    TCN_SELCHANGE, WC_TABCONTROL,
+};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -17,7 +21,7 @@ use crate::localization::LanguageId;
 use crate::native_interop;
 
 use super::settings::{
-    AlertThreshold, DisplayChoice, PollInterval, QuotaWindow, SettingsCommand, SettingsView, Toggle,
+    AlertThreshold, DisplayChoice, PollInterval, SettingsCommand, SettingsView, Toggle, UsageRow,
 };
 use super::{
     claude_code_menu_label, load_embedded_app_icons, tr, Appearance, BarStyle, BarThickness,
@@ -25,19 +29,20 @@ use super::{
 };
 
 const CLASS_NAME: &str = "AIUsageMonitorSettings";
+const PROVIDER_CLASS_NAME: &str = "AIUsageMonitorProviderSettings";
 const CONTROL_ID_BASE: u16 = 100;
-const FIELD_COUNT: usize = 21;
-const SECTION_COUNT: usize = 8;
-const CLIENT_WIDTH: i32 = 440;
+const TAB_CONTROL_ID: u16 = 90;
+const FIELD_COUNT: usize = 23;
+const CLIENT_WIDTH: i32 = 460;
 const PAD: i32 = 12;
+const COMBO_DROP_HEIGHT: i32 = 200;
 /// windows 0.58 has no name for this message. It sizes the drop list without
 /// stretching the combo over the rows below it.
 const CB_SETMINVISIBLE: u32 = 0x1701;
 
 thread_local! {
     static DIALOG: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
-    // SendMessage while painting controls re-enters the wndproc. A bool on
-    // DialogState would alias that borrow, so the guard lives beside it.
+    static PROVIDER_DIALOG: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
     static SYNCING: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -81,6 +86,7 @@ pub(super) fn open(widget: HWND) {
         return;
     }
 
+    ensure_common_controls();
     ensure_class();
     let instance = match unsafe { GetModuleHandleW(PCWSTR::null()) } {
         Ok(module) => HINSTANCE(module.0),
@@ -90,9 +96,10 @@ pub(super) fn open(widget: HWND) {
         widget,
         dpi: 96,
         font: HFONT::default(),
+        tab: HWND::default(),
+        active_tab: Tab::Models,
         controls: vec![HWND::default(); FIELD_COUNT],
         labels: vec![HWND::default(); FIELD_COUNT],
-        headers: vec![HWND::default(); SECTION_COUNT],
         combo_keys: vec![String::new(); FIELD_COUNT],
         positioned: false,
         anchor: None,
@@ -133,6 +140,12 @@ pub(super) fn open(widget: HWND) {
 }
 
 pub(super) fn pre_translate(msg: &MSG) -> bool {
+    let provider = PROVIDER_DIALOG.with(|cell| cell.get());
+    if !provider.is_invalid() && unsafe { IsWindow(provider).as_bool() } {
+        if unsafe { IsDialogMessageW(provider, msg).as_bool() } {
+            return true;
+        }
+    }
     let hwnd = DIALOG.with(|cell| cell.get());
     if hwnd.is_invalid() || !unsafe { IsWindow(hwnd).as_bool() } {
         return false;
@@ -142,10 +155,13 @@ pub(super) fn pre_translate(msg: &MSG) -> bool {
 
 pub(super) fn sync() {
     let hwnd = DIALOG.with(|cell| cell.get());
-    if hwnd.is_invalid() || !unsafe { IsWindow(hwnd).as_bool() } {
-        return;
+    if !hwnd.is_invalid() && unsafe { IsWindow(hwnd).as_bool() } {
+        sync_hwnd(hwnd);
     }
-    sync_hwnd(hwnd);
+    let provider = PROVIDER_DIALOG.with(|cell| cell.get());
+    if !provider.is_invalid() && unsafe { IsWindow(provider).as_bool() } {
+        sync_provider_hwnd(provider);
+    }
 }
 
 fn sync_hwnd(hwnd: HWND) {
@@ -165,6 +181,17 @@ fn dialog_style() -> WINDOW_STYLE {
 
 fn dialog_ex_style() -> WINDOW_EX_STYLE {
     WS_EX_CONTROLPARENT | WS_EX_DLGMODALFRAME
+}
+
+fn ensure_common_controls() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let controls = INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_TAB_CLASSES,
+        };
+        let _ = unsafe { InitCommonControlsEx(&controls) };
+    });
 }
 
 fn ensure_class() {
@@ -201,8 +228,6 @@ unsafe extern "system" fn dialog_proc(
         WM_CREATE => {
             let created = &*(lparam.0 as *const CREATESTRUCTW);
             let state = &mut *(created.lpCreateParams as *mut DialogState);
-            // The widget's CURRENT_DPI follows the taskbar. This window sits on
-            // the monitor work area, so its scale comes from its own DPI.
             let dpi = GetDpiForWindow(hwnd).max(96);
             state.dpi = dpi;
             state.font = message_font(dpi);
@@ -211,6 +236,7 @@ unsafe extern "system" fn dialog_proc(
             LRESULT(0)
         }
         WM_COMMAND => on_command(hwnd, wparam, lparam),
+        WM_NOTIFY => on_notify(hwnd, lparam),
         msg if msg == DM_GETDEFID => {
             let packed = ((DC_HASDEFID as u32) << 16) | Field::Close.control_id() as u32;
             LRESULT(packed as isize)
@@ -239,6 +265,7 @@ unsafe extern "system" fn dialog_proc(
             LRESULT(0)
         }
         WM_CLOSE => {
+            close_provider_dialog();
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
@@ -262,6 +289,27 @@ unsafe extern "system" fn dialog_proc(
     }
 }
 
+fn on_notify(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    if lparam.0 == 0 {
+        return LRESULT(0);
+    }
+    let header = unsafe { &*(lparam.0 as *const NMHDR) };
+    if header.idFrom == TAB_CONTROL_ID as usize && header.code == TCN_SELCHANGE {
+        let Some(state) = state_mut(hwnd) else {
+            return LRESULT(0);
+        };
+        let selected = unsafe { SendMessageW(state.tab, TCM_GETCURSEL, WPARAM(0), LPARAM(0)).0 };
+        if selected >= 0 {
+            if let Some(tab) = Tab::from_index(selected as usize) {
+                state.active_tab = tab;
+                let view = SettingsView::read();
+                layout(hwnd, state, &view);
+            }
+        }
+    }
+    LRESULT(0)
+}
+
 fn on_command(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if SYNCING.with(|flag| flag.get()) {
         return LRESULT(0);
@@ -269,6 +317,7 @@ fn on_command(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let id = (wparam.0 & 0xffff) as i32;
     let code = ((wparam.0 >> 16) & 0xffff) as u16;
     if id == IDOK.0 || id == IDCANCEL.0 {
+        close_provider_dialog();
         let _ = unsafe { DestroyWindow(hwnd) };
         return LRESULT(0);
     }
@@ -279,6 +328,7 @@ fn on_command(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         return LRESULT(0);
     }
     if field == Field::Close {
+        close_provider_dialog();
         let _ = unsafe { DestroyWindow(hwnd) };
         return LRESULT(0);
     }
@@ -287,9 +337,14 @@ fn on_command(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         .unwrap_or_default();
     let control = HWND(lparam.0 as *mut _);
     let view = SettingsView::read();
-    match field.command(&view, control) {
-        Some(command) => super::settings::apply(widget, command),
-        None => sync_hwnd(hwnd),
+    match field {
+        Field::SettingsClaude => open_provider_dialog(hwnd, widget, FocusedProvider::ClaudeCode),
+        Field::SettingsCodex => open_provider_dialog(hwnd, widget, FocusedProvider::Codex),
+        Field::SettingsCursor => open_provider_dialog(hwnd, widget, FocusedProvider::Cursor),
+        _ => match field.command(&view, control) {
+            Some(command) => super::settings::apply(widget, command),
+            None => sync_hwnd(hwnd),
+        },
     }
     LRESULT(0)
 }
@@ -298,9 +353,10 @@ struct DialogState {
     widget: HWND,
     dpi: u32,
     font: HFONT,
+    tab: HWND,
+    active_tab: Tab,
     controls: Vec<HWND>,
     labels: Vec<HWND>,
-    headers: Vec<HWND>,
     combo_keys: Vec<String>,
     positioned: bool,
     anchor: Option<(i32, i32)>,
@@ -316,10 +372,14 @@ fn state_mut(hwnd: HWND) -> Option<&'static mut DialogState> {
 }
 
 fn create_children(parent: HWND, state: &mut DialogState, instance: HINSTANCE) {
-    for section in Section::ALL {
-        state.headers[section.index()] =
-            create_child(parent, w!("STATIC"), "", WS_CHILD | WS_VISIBLE, 0, instance);
-    }
+    state.tab = create_child(
+        parent,
+        WC_TABCONTROL,
+        "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(WS_CLIPSIBLINGS.0),
+        TAB_CONTROL_ID,
+        instance,
+    );
     for field in Field::ALL {
         let index = field.index();
         let (class, style) = match field.kind() {
@@ -347,19 +407,25 @@ fn create_children(parent: HWND, state: &mut DialogState, instance: HINSTANCE) {
                 )
             }
         };
-        state.controls[index] =
-            create_child(parent, class, "", style, field.control_id(), instance);
+        let create_h = if field.kind() == ControlKind::Choice {
+            COMBO_DROP_HEIGHT
+        } else {
+            10
+        };
+        state.controls[index] = create_child_sized(
+            parent,
+            class,
+            "",
+            style,
+            field.control_id(),
+            instance,
+            10,
+            create_h,
+        );
         state.labels[index] =
             create_child(parent, w!("STATIC"), "", WS_CHILD | WS_VISIBLE, 0, instance);
         if field.kind() == ControlKind::Choice {
-            unsafe {
-                SendMessageW(
-                    state.controls[index],
-                    CB_SETMINVISIBLE,
-                    WPARAM(8),
-                    LPARAM(0),
-                );
-            }
+            set_combo_min_visible(state.controls[index]);
         }
     }
     paint_font(state);
@@ -373,6 +439,19 @@ fn create_child(
     id: u16,
     instance: HINSTANCE,
 ) -> HWND {
+    create_child_sized(parent, class, text, style, id, instance, 10, 10)
+}
+
+fn create_child_sized(
+    parent: HWND,
+    class: PCWSTR,
+    text: &str,
+    style: WINDOW_STYLE,
+    id: u16,
+    instance: HINSTANCE,
+    width: i32,
+    height: i32,
+) -> HWND {
     let wide = native_interop::wide_str(text);
     unsafe {
         CreateWindowExW(
@@ -382,8 +461,8 @@ fn create_child(
             style,
             0,
             0,
-            10,
-            10,
+            width,
+            height,
             parent,
             HMENU(id as usize as *mut _),
             instance,
@@ -393,15 +472,20 @@ fn create_child(
     }
 }
 
+fn set_combo_min_visible(control: HWND) {
+    if control.is_invalid() {
+        return;
+    }
+    unsafe {
+        SendMessageW(control, CB_SETMINVISIBLE, WPARAM(8), LPARAM(0));
+    }
+}
+
 fn apply_view(hwnd: HWND, state: &mut DialogState, view: &SettingsView) {
     set_text(hwnd, &view.strings().settings);
-    for section in Section::ALL {
-        let header = state.headers[section.index()];
-        match section_title(section, view) {
-            Some(title) if section_visible(section, view) => set_text(header, &title),
-            _ => {}
-        }
-    }
+    fill_tabs(state, view);
+    let strings = view.strings();
+    let language = view.language;
     for field in Field::ALL {
         let index = field.index();
         let control = state.controls[index];
@@ -423,6 +507,7 @@ fn apply_view(hwnd: HWND, state: &mut DialogState, view: &SettingsView) {
                 if state.combo_keys[index] != key {
                     refill_combo(control, &options);
                     state.combo_keys[index] = key;
+                    set_combo_min_visible(control);
                 }
                 let selection = selected.unwrap_or(usize::MAX);
                 unsafe {
@@ -438,78 +523,244 @@ fn apply_view(hwnd: HWND, state: &mut DialogState, view: &SettingsView) {
         if let Some(label) = field.side_label(view) {
             set_text(state.labels[index], &label);
         }
+        // Model rows use the provider field's static label for the name column.
+        if let Some(provider) = field.provider() {
+            if matches!(
+                field,
+                Field::ProviderClaude | Field::ProviderCodex | Field::ProviderCursor
+            ) {
+                let name = match provider {
+                    FocusedProvider::ClaudeCode => {
+                        claude_code_menu_label(strings, language, view.claude_available())
+                    }
+                    FocusedProvider::Codex => strings.codex_model.to_string(),
+                    FocusedProvider::Cursor => strings.cursor_model.to_string(),
+                };
+                set_text(state.labels[index], &name);
+            }
+        }
     }
     layout(hwnd, state, view);
+}
+
+fn fill_tabs(state: &mut DialogState, view: &SettingsView) {
+    if state.tab.is_invalid() {
+        return;
+    }
+    let count = unsafe { SendMessageW(state.tab, TCM_GETITEMCOUNT, WPARAM(0), LPARAM(0)).0 };
+    let insert = count <= 0;
+    for (index, tab) in Tab::ALL.iter().enumerate() {
+        let title = tab.title(view);
+        let mut wide = native_interop::wide_str(&title);
+        let mut item = TCITEMW {
+            mask: TCIF_TEXT,
+            pszText: windows::core::PWSTR(wide.as_mut_ptr()),
+            ..Default::default()
+        };
+        unsafe {
+            if insert {
+                SendMessageW(
+                    state.tab,
+                    TCM_INSERTITEMW,
+                    WPARAM(index),
+                    LPARAM(&mut item as *mut _ as isize),
+                );
+            } else {
+                SendMessageW(
+                    state.tab,
+                    TCM_SETITEMW,
+                    WPARAM(index),
+                    LPARAM(&mut item as *mut _ as isize),
+                );
+            }
+        }
+    }
+    unsafe {
+        SendMessageW(
+            state.tab,
+            TCM_SETCURSEL,
+            WPARAM(state.active_tab.index()),
+            LPARAM(0),
+        );
+    }
 }
 
 fn layout(hwnd: HWND, state: &mut DialogState, view: &SettingsView) {
     let dpi = state.dpi;
     let pad = px(dpi, PAD);
     let width = px(dpi, CLIENT_WIDTH);
-    let mut y = pad;
-    let mut last_section: Option<Section> = None;
+    // Keep the tab strip to header height only. A full-page SysTabControl32
+    // paints over sibling controls after any click/sync, which looks blank.
+    let tab_h = px(dpi, 30);
+    place_z(state.tab, HWND_BOTTOM, pad, pad, width, tab_h, true);
+    let content_left = pad;
+    let content_width = width;
+    let mut y = pad + tab_h + pad;
+
+    // Hide every field first, then show the active tab (+ Close).
     for field in Field::ALL {
         let index = field.index();
-        let control = state.controls[index];
-        let label = state.labels[index];
-        if !field.is_visible(view) || control.is_invalid() {
-            place(control, 0, 0, 0, 0, false);
-            place(label, 0, 0, 0, 0, false);
-            continue;
-        }
-        if last_section != Some(field.section()) {
-            if let Some(previous) = last_section {
-                if !section_visible(previous, view) {
-                    place(state.headers[previous.index()], 0, 0, 0, 0, false);
-                }
+        place_z(
+            state.controls[index],
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            false,
+        );
+        place_z(state.labels[index], HWND_TOP, 0, 0, 0, 0, false);
+    }
+
+    if state.active_tab == Tab::Models {
+        y = layout_model_rows(state, view, dpi, content_left, content_width, y);
+    } else {
+        for field in Field::ALL {
+            if field.tab() != Some(state.active_tab) || !field.is_visible(view) {
+                continue;
             }
-            last_section = Some(field.section());
-            let header = state.headers[field.section().index()];
-            if section_title(field.section(), view).is_some() {
-                place(header, pad, y, width, px(dpi, 18), true);
-                y += px(dpi, 22);
-            } else {
-                place(header, 0, 0, 0, 0, false);
-                y += px(dpi, 8);
+            if matches!(
+                field,
+                Field::ProviderClaude
+                    | Field::ProviderCodex
+                    | Field::ProviderCursor
+                    | Field::SettingsClaude
+                    | Field::SettingsCodex
+                    | Field::SettingsCursor
+            ) {
+                continue;
             }
-        }
-        match field.kind() {
-            ControlKind::Check => {
-                place(control, pad, y, width, px(dpi, 22), true);
-                place(label, 0, 0, 0, 0, false);
-                y += px(dpi, 26);
-            }
-            ControlKind::Choice => {
-                let row_h = px(dpi, 24);
-                if field.side_label(view).is_some() {
-                    let label_w = px(dpi, 150);
-                    place(label, pad, y + px(dpi, 3), label_w, px(dpi, 18), true);
-                    place(control, pad + label_w, y, width - label_w, row_h, true);
-                } else {
-                    place(label, 0, 0, 0, 0, false);
-                    place(control, pad, y, width, row_h, true);
-                }
-                y += px(dpi, 30);
-            }
-            ControlKind::Button => {
-                place(control, pad, y, width, px(dpi, 26), true);
-                place(label, 0, 0, 0, 0, false);
-                y += px(dpi, 32);
-            }
+            y = layout_field_row(state, view, field, dpi, content_left, content_width, y);
         }
     }
-    if let Some(previous) = last_section {
-        if !section_visible(previous, view) {
-            place(state.headers[previous.index()], 0, 0, 0, 0, false);
-        }
-    }
-    for section in Section::ALL {
-        if !section_visible(section, view) {
-            place(state.headers[section.index()], 0, 0, 0, 0, false);
-        }
-    }
+
     y += pad;
-    size_dialog(hwnd, state, pad * 2 + width, y);
+    let close = Field::Close;
+    place_z(
+        state.controls[close.index()],
+        HWND_TOP,
+        content_left,
+        y,
+        content_width,
+        px(dpi, 28),
+        true,
+    );
+    y += px(dpi, 28) + pad;
+    size_dialog(hwnd, state, pad * 2 + width, y + pad);
+}
+
+fn layout_model_rows(
+    state: &DialogState,
+    view: &SettingsView,
+    dpi: u32,
+    left: i32,
+    width: i32,
+    mut y: i32,
+) -> i32 {
+    let rows = [
+        (
+            Field::ProviderClaude,
+            Field::SettingsClaude,
+            FocusedProvider::ClaudeCode,
+        ),
+        (
+            Field::ProviderCodex,
+            Field::SettingsCodex,
+            FocusedProvider::Codex,
+        ),
+        (
+            Field::ProviderCursor,
+            Field::SettingsCursor,
+            FocusedProvider::Cursor,
+        ),
+    ];
+    let name_w = px(dpi, 170);
+    let check_w = px(dpi, 72);
+    let gap = px(dpi, 8);
+    let row_h = px(dpi, 28);
+    let settings_w = (width - name_w - check_w - gap * 2).max(px(dpi, 80));
+    for (provider_field, settings_field, provider) in rows {
+        let name = state.labels[provider_field.index()];
+        let check = state.controls[provider_field.index()];
+        let settings = state.controls[settings_field.index()];
+        place_z(name, HWND_TOP, left, y + px(dpi, 5), name_w, px(dpi, 18), true);
+        place_z(
+            check,
+            HWND_TOP,
+            left + name_w + gap,
+            y,
+            check_w,
+            row_h,
+            true,
+        );
+        let settings_enabled = provider != FocusedProvider::ClaudeCode || view.claude_available();
+        let _ = unsafe { EnableWindow(settings, settings_enabled) };
+        place_z(
+            settings,
+            HWND_TOP,
+            left + name_w + gap + check_w + gap,
+            y,
+            settings_w,
+            row_h,
+            true,
+        );
+        y += row_h + px(dpi, 8);
+    }
+    y
+}
+
+fn layout_field_row(
+    state: &DialogState,
+    view: &SettingsView,
+    field: Field,
+    dpi: u32,
+    left: i32,
+    width: i32,
+    y: i32,
+) -> i32 {
+    let index = field.index();
+    let control = state.controls[index];
+    let label = state.labels[index];
+    match field.kind() {
+        ControlKind::Check => {
+            place_z(control, HWND_TOP, left, y, width, px(dpi, 22), true);
+            place_z(label, HWND_TOP, 0, 0, 0, 0, false);
+            y + px(dpi, 26)
+        }
+        ControlKind::Choice => {
+            let row_h = px(dpi, 24);
+            if field.side_label(view).is_some() {
+                let label_w = px(dpi, 150);
+                place_z(
+                    label,
+                    HWND_TOP,
+                    left,
+                    y + px(dpi, 3),
+                    label_w,
+                    px(dpi, 18),
+                    true,
+                );
+                place_z(
+                    control,
+                    HWND_TOP,
+                    left + label_w,
+                    y,
+                    width - label_w,
+                    row_h,
+                    true,
+                );
+            } else {
+                place_z(label, HWND_TOP, 0, 0, 0, 0, false);
+                place_z(control, HWND_TOP, left, y, width, row_h, true);
+            }
+            y + px(dpi, 30)
+        }
+        ControlKind::Button => {
+            place_z(control, HWND_TOP, left, y, width, px(dpi, 28), true);
+            place_z(label, HWND_TOP, 0, 0, 0, 0, false);
+            y + px(dpi, 34)
+        }
+    }
 }
 
 fn size_dialog(hwnd: HWND, state: &mut DialogState, client_w: i32, client_h: i32) {
@@ -586,19 +837,20 @@ fn center_on_widget(widget: HWND, width: i32, height: i32) -> (i32, i32) {
 }
 
 fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32, show: bool) {
+    place_z(hwnd, HWND::default(), x, y, width, height, show);
+}
+
+fn place_z(hwnd: HWND, insert_after: HWND, x: i32, y: i32, width: i32, height: i32, show: bool) {
     if hwnd.is_invalid() {
         return;
     }
+    let flags = if insert_after == HWND::default() {
+        SWP_NOZORDER | SWP_NOACTIVATE
+    } else {
+        SWP_NOACTIVATE
+    };
     unsafe {
-        let _ = SetWindowPos(
-            hwnd,
-            HWND::default(),
-            x,
-            y,
-            width,
-            height,
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        );
+        let _ = SetWindowPos(hwnd, insert_after, x, y, width, height, flags);
         let _ = ShowWindow(hwnd, if show { SW_SHOW } else { SW_HIDE });
     }
 }
@@ -626,12 +878,10 @@ fn paint_font(state: &DialogState) {
     }
     let font = WPARAM(state.font.0 as usize);
     unsafe {
-        for hwnd in state
-            .controls
-            .iter()
-            .chain(state.labels.iter())
-            .chain(state.headers.iter())
-        {
+        if !state.tab.is_invalid() {
+            SendMessageW(state.tab, WM_SETFONT, font, LPARAM(1));
+        }
+        for hwnd in state.controls.iter().chain(state.labels.iter()) {
             if !hwnd.is_invalid() {
                 SendMessageW(*hwnd, WM_SETFONT, font, LPARAM(1));
             }
@@ -715,57 +965,46 @@ fn refill_combo(control: HWND, options: &[String]) {
                 LPARAM(wide.as_ptr() as isize),
             );
         }
+        set_combo_min_visible(control);
     }
 }
 
-fn section_visible(section: Section, view: &SettingsView) -> bool {
-    Field::ALL
-        .iter()
-        .any(|field| field.section() == section && field.is_visible(view))
-}
-
-fn section_title(section: Section, view: &SettingsView) -> Option<String> {
-    let language = view.language;
-    let strings = view.strings();
-    let title: &str = match section {
-        Section::Refresh => strings.update_frequency,
-        Section::Providers => strings.models,
-        Section::Usage => tr(language, "사용량 표시", "Usage display"),
-        Section::Alerts => tr(language, "할당량 알림", "Quota alerts"),
-        Section::Appearance => tr(language, "모양", "Appearance"),
-        Section::Language => strings.language,
-        Section::Position => "Position",
-        Section::General => return None,
-    };
-    Some(title.to_string())
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Section {
-    Refresh = 0,
-    Providers = 1,
-    Usage = 2,
+enum Tab {
+    Models = 0,
+    Appearance = 1,
+    Refresh = 2,
     Alerts = 3,
-    Appearance = 4,
-    Language = 5,
-    Position = 6,
-    General = 7,
+    General = 4,
 }
 
-impl Section {
-    const ALL: [Section; SECTION_COUNT] = [
-        Self::Refresh,
-        Self::Providers,
-        Self::Usage,
-        Self::Alerts,
+impl Tab {
+    const ALL: [Tab; 5] = [
+        Self::Models,
         Self::Appearance,
-        Self::Language,
-        Self::Position,
+        Self::Refresh,
+        Self::Alerts,
         Self::General,
     ];
 
     fn index(self) -> usize {
         self as usize
+    }
+
+    fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+
+    fn title(self, view: &SettingsView) -> String {
+        let language = view.language;
+        let strings = view.strings();
+        match self {
+            Self::Models => strings.models.to_string(),
+            Self::Appearance => tr(language, "모양", "Appearance").to_string(),
+            Self::Refresh => strings.update_frequency.to_string(),
+            Self::Alerts => tr(language, "알림", "Alerts").to_string(),
+            Self::General => tr(language, "일반", "General").to_string(),
+        }
     }
 }
 
@@ -794,17 +1033,22 @@ enum Presented {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Field {
-    PollInterval,
-    AdaptiveRefresh,
-    Provider(FocusedProvider),
-    QuotaWindow(QuotaWindow),
-    AlertThreshold,
+    ProviderClaude,
+    SettingsClaude,
+    ProviderCodex,
+    SettingsCodex,
+    ProviderCursor,
+    SettingsCursor,
     Palette,
     BarStyle,
     BarThickness,
     FontSize,
     AppearanceRecommended,
     AppearanceReset,
+    PollInterval,
+    AdaptiveRefresh,
+    PreciseReset,
+    AlertThreshold,
     Language,
     Display,
     AnchorLeft,
@@ -816,20 +1060,22 @@ enum Field {
 
 impl Field {
     const ALL: [Field; FIELD_COUNT] = [
-        Self::PollInterval,
-        Self::AdaptiveRefresh,
-        Self::Provider(FocusedProvider::ClaudeCode),
-        Self::Provider(FocusedProvider::Codex),
-        Self::Provider(FocusedProvider::Cursor),
-        Self::QuotaWindow(QuotaWindow::Session),
-        Self::QuotaWindow(QuotaWindow::Weekly),
-        Self::AlertThreshold,
+        Self::ProviderClaude,
+        Self::SettingsClaude,
+        Self::ProviderCodex,
+        Self::SettingsCodex,
+        Self::ProviderCursor,
+        Self::SettingsCursor,
         Self::Palette,
         Self::BarStyle,
         Self::BarThickness,
         Self::FontSize,
         Self::AppearanceRecommended,
         Self::AppearanceReset,
+        Self::PollInterval,
+        Self::AdaptiveRefresh,
+        Self::PreciseReset,
+        Self::AlertThreshold,
         Self::Language,
         Self::Display,
         Self::AnchorLeft,
@@ -854,9 +1100,11 @@ impl Field {
 
     fn kind(self) -> ControlKind {
         match self {
-            Self::AdaptiveRefresh
-            | Self::Provider(_)
-            | Self::QuotaWindow(_)
+            Self::ProviderClaude
+            | Self::ProviderCodex
+            | Self::ProviderCursor
+            | Self::AdaptiveRefresh
+            | Self::PreciseReset
             | Self::AnchorLeft
             | Self::WidgetVisible
             | Self::StartWithWindows => ControlKind::Check,
@@ -868,28 +1116,48 @@ impl Field {
             | Self::FontSize
             | Self::Language
             | Self::Display => ControlKind::Choice,
-            Self::AppearanceRecommended
+            Self::SettingsClaude
+            | Self::SettingsCodex
+            | Self::SettingsCursor
+            | Self::AppearanceRecommended
             | Self::AppearanceReset
             | Self::ResetPosition
             | Self::Close => ControlKind::Button,
         }
     }
 
-    fn section(self) -> Section {
+    fn tab(self) -> Option<Tab> {
         match self {
-            Self::PollInterval | Self::AdaptiveRefresh => Section::Refresh,
-            Self::Provider(_) => Section::Providers,
-            Self::QuotaWindow(_) => Section::Usage,
-            Self::AlertThreshold => Section::Alerts,
+            Self::ProviderClaude
+            | Self::SettingsClaude
+            | Self::ProviderCodex
+            | Self::SettingsCodex
+            | Self::ProviderCursor
+            | Self::SettingsCursor => Some(Tab::Models),
             Self::Palette
             | Self::BarStyle
             | Self::BarThickness
             | Self::FontSize
             | Self::AppearanceRecommended
-            | Self::AppearanceReset => Section::Appearance,
-            Self::Language => Section::Language,
-            Self::Display | Self::AnchorLeft | Self::ResetPosition => Section::Position,
-            Self::WidgetVisible | Self::StartWithWindows | Self::Close => Section::General,
+            | Self::AppearanceReset => Some(Tab::Appearance),
+            Self::PollInterval | Self::AdaptiveRefresh | Self::PreciseReset => Some(Tab::Refresh),
+            Self::AlertThreshold => Some(Tab::Alerts),
+            Self::Language
+            | Self::Display
+            | Self::AnchorLeft
+            | Self::ResetPosition
+            | Self::WidgetVisible
+            | Self::StartWithWindows => Some(Tab::General),
+            Self::Close => None,
+        }
+    }
+
+    fn provider(self) -> Option<FocusedProvider> {
+        match self {
+            Self::ProviderClaude | Self::SettingsClaude => Some(FocusedProvider::ClaudeCode),
+            Self::ProviderCodex | Self::SettingsCodex => Some(FocusedProvider::Codex),
+            Self::ProviderCursor | Self::SettingsCursor => Some(FocusedProvider::Cursor),
+            _ => None,
         }
     }
 
@@ -914,7 +1182,10 @@ impl Field {
             Self::BarStyle => tr(language, "막대 스타일", "Bar style"),
             Self::BarThickness => tr(language, "막대 두께", "Bar thickness"),
             Self::FontSize => tr(language, "글자 크기", "Text size"),
+            Self::PollInterval => tr(language, "업데이트 주기", "Update frequency"),
+            Self::AlertThreshold => tr(language, "할당량 알림", "Quota alerts"),
             Self::Display => tr(language, "디스플레이", "Display"),
+            Self::Language => view.strings().language,
             _ => return None,
         };
         Some(label.to_string())
@@ -924,6 +1195,26 @@ impl Field {
         let strings = view.strings();
         let language = view.language;
         match self {
+            Self::ProviderClaude | Self::ProviderCodex | Self::ProviderCursor => {
+                let provider = self.provider().unwrap();
+                let toggle = view.provider(provider);
+                let enabled = if provider == FocusedProvider::ClaudeCode {
+                    view.claude_available() && toggle.enabled
+                } else {
+                    toggle.enabled
+                };
+                Presented::Check {
+                    text: tr(language, "표시", "Show").to_string(),
+                    toggle: Toggle {
+                        checked: toggle.checked,
+                        enabled,
+                    },
+                }
+            }
+            Self::SettingsClaude | Self::SettingsCodex | Self::SettingsCursor => Presented::Button {
+                text: tr(language, "설정", "Settings").to_string(),
+                enabled: true,
+            },
             Self::PollInterval => choice(
                 PollInterval::ALL.map(|interval| interval.label(strings).to_string()),
                 PollInterval::ALL
@@ -942,33 +1233,13 @@ impl Field {
                     enabled: true,
                 },
             ),
-            Self::Provider(provider) => {
-                let toggle = view.provider(provider);
-                let text = match provider {
-                    FocusedProvider::ClaudeCode => {
-                        claude_code_menu_label(strings, language, view.claude_available())
-                    }
-                    FocusedProvider::Codex => strings.codex_model.to_string(),
-                    FocusedProvider::Cursor => strings.cursor_model.to_string(),
-                };
-                let toggle = if provider == FocusedProvider::ClaudeCode && !view.claude_available()
-                {
-                    Toggle {
-                        enabled: false,
-                        ..toggle
-                    }
-                } else {
-                    toggle
-                };
-                Presented::Check { text, toggle }
-            }
-            Self::QuotaWindow(window) => {
-                let text = match window {
-                    QuotaWindow::Session => tr(language, "5시간 할당량", "5-hour quota"),
-                    QuotaWindow::Weekly => tr(language, "주간 할당량", "Weekly quota"),
-                };
-                check(text, view.quota_window(window))
-            }
+            Self::PreciseReset => check(
+                tr(language, "정확한 갱신 시각/기간", "Precise reset time"),
+                Toggle {
+                    checked: view.precise_reset,
+                    enabled: true,
+                },
+            ),
             Self::AlertThreshold => choice(
                 AlertThreshold::ALL.map(|threshold| threshold.label(language).to_string()),
                 AlertThreshold::ALL
@@ -1069,13 +1340,11 @@ impl Field {
             ControlKind::Check => {
                 let shown = is_checked(control);
                 match self {
+                    Self::ProviderClaude | Self::ProviderCodex | Self::ProviderCursor => self
+                        .provider()
+                        .map(|provider| SettingsCommand::SetProviderShown(provider, shown)),
                     Self::AdaptiveRefresh => Some(SettingsCommand::SetAdaptiveRefresh(shown)),
-                    Self::Provider(provider) => {
-                        Some(SettingsCommand::SetProviderShown(provider, shown))
-                    }
-                    Self::QuotaWindow(window) => {
-                        Some(SettingsCommand::SetQuotaWindowShown(window, shown))
-                    }
+                    Self::PreciseReset => Some(SettingsCommand::SetPreciseReset(shown)),
                     Self::AnchorLeft => Some(SettingsCommand::SetAnchorLeft(shown)),
                     Self::WidgetVisible => Some(SettingsCommand::SetWidgetVisible(shown)),
                     Self::StartWithWindows => Some(SettingsCommand::SetStartWithWindows(shown)),
@@ -1146,7 +1415,6 @@ impl Field {
                     Some(SettingsCommand::SetAppearance(Appearance::default()))
                 }
                 Self::ResetPosition => Some(SettingsCommand::ResetPosition),
-                Self::Close => None,
                 _ => None,
             },
         }
@@ -1167,8 +1435,8 @@ fn button(text: &str) -> Presented {
     }
 }
 
-fn choice<const N: usize>(
-    options: [String; N],
+fn choice(
+    options: impl IntoIterator<Item = String>,
     selected: Option<usize>,
     enabled: bool,
 ) -> Presented {
@@ -1211,6 +1479,383 @@ where
     Some(SettingsCommand::SetAppearance(appearance))
 }
 
+// --- Provider detail dialog -------------------------------------------------
+
+const PROVIDER_ID_BASE: u16 = 300;
+const PROVIDER_CLOSE_ID: u16 = 399;
+
+struct ProviderDialogState {
+    widget: HWND,
+    owner: HWND,
+    provider: FocusedProvider,
+    dpi: u32,
+    font: HFONT,
+    controls: Vec<(u16, HWND)>,
+}
+
+fn close_provider_dialog() {
+    let hwnd = PROVIDER_DIALOG.with(|cell| cell.get());
+    if !hwnd.is_invalid() && unsafe { IsWindow(hwnd).as_bool() } {
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+}
+
+fn open_provider_dialog(owner: HWND, widget: HWND, provider: FocusedProvider) {
+    let existing = PROVIDER_DIALOG.with(|cell| cell.get());
+    if unsafe { IsWindow(existing).as_bool() } {
+        let same = provider_state_mut(existing).is_some_and(|s| s.provider == provider);
+        if same {
+            unsafe {
+                let _ = ShowWindow(existing, SW_RESTORE);
+                let _ = SetForegroundWindow(existing);
+            }
+            sync_provider_hwnd(existing);
+            return;
+        }
+        let _ = unsafe { DestroyWindow(existing) };
+    }
+
+    ensure_provider_class();
+    let instance = match unsafe { GetModuleHandleW(PCWSTR::null()) } {
+        Ok(module) => HINSTANCE(module.0),
+        Err(_) => return,
+    };
+    let dpi = unsafe { GetDpiForWindow(owner) }.max(96);
+    let state = Box::new(ProviderDialogState {
+        widget,
+        owner,
+        provider,
+        dpi,
+        font: message_font(dpi),
+        controls: Vec::new(),
+    });
+    let raw = Box::into_raw(state);
+    let title = provider_dialog_title(provider);
+    let class_name = native_interop::wide_str(PROVIDER_CLASS_NAME);
+    let title_wide = native_interop::wide_str(&title);
+    let created = unsafe {
+        CreateWindowExW(
+            dialog_ex_style(),
+            PCWSTR::from_raw(class_name.as_ptr()),
+            PCWSTR::from_raw(title_wide.as_ptr()),
+            dialog_style(),
+            0,
+            0,
+            100,
+            100,
+            owner,
+            None,
+            instance,
+            Some(raw as *const _),
+        )
+    };
+    let hwnd = match created {
+        Ok(hwnd) => hwnd,
+        Err(error) => {
+            drop(unsafe { Box::from_raw(raw) });
+            crate::diagnose::log(format!("provider settings dialog was not created: {error}"));
+            return;
+        }
+    };
+    PROVIDER_DIALOG.with(|cell| cell.set(hwnd));
+    sync_provider_hwnd(hwnd);
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+fn provider_dialog_title(provider: FocusedProvider) -> String {
+    let view = SettingsView::read();
+    let strings = view.strings();
+    match provider {
+        FocusedProvider::ClaudeCode => {
+            claude_code_menu_label(strings, view.language, view.claude_available())
+        }
+        FocusedProvider::Codex => strings.codex_model.to_string(),
+        FocusedProvider::Cursor => strings.cursor_model.to_string(),
+    }
+}
+
+fn ensure_provider_class() {
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| {
+        let class_name = native_interop::wide_str(PROVIDER_CLASS_NAME);
+        let instance = unsafe { GetModuleHandleW(PCWSTR::null()) }.unwrap_or_default();
+        let class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(provider_proc),
+            hInstance: HINSTANCE(instance.0),
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW).unwrap_or_default() },
+            hbrBackground: unsafe { GetSysColorBrush(COLOR_BTNFACE) },
+            lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
+            ..Default::default()
+        };
+        if unsafe { RegisterClassExW(&class) } == 0 {
+            crate::diagnose::log("provider settings dialog class was not registered");
+        }
+    });
+}
+
+unsafe extern "system" fn provider_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CREATE => {
+            let created = &*(lparam.0 as *const CREATESTRUCTW);
+            let state = &mut *(created.lpCreateParams as *mut ProviderDialogState);
+            let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, created.lpCreateParams as isize);
+            create_provider_children(hwnd, state, created.hInstance);
+            LRESULT(0)
+        }
+        WM_COMMAND => on_provider_command(hwnd, wparam, lparam),
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            if PROVIDER_DIALOG.with(|cell| cell.get()) == hwnd {
+                PROVIDER_DIALOG.with(|cell| cell.set(HWND::default()));
+            }
+            // Repaint the parent settings page; the tab strip must stay behind
+            // the model rows after the owned popup closes.
+            sync();
+            LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            let raw = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut ProviderDialogState;
+            if !raw.is_null() {
+                let state = Box::from_raw(raw);
+                if !state.font.is_invalid() {
+                    let _ = DeleteObject(state.font);
+                }
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn provider_state_mut(hwnd: HWND) -> Option<&'static mut ProviderDialogState> {
+    let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut ProviderDialogState;
+    if raw.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *raw })
+    }
+}
+
+fn provider_row_ids(provider: FocusedProvider) -> Vec<ProviderControl> {
+    let mut controls = Vec::new();
+    match provider {
+        FocusedProvider::ClaudeCode => {}
+        FocusedProvider::Codex => {
+            controls.push(ProviderControl::Usage(UsageRow::CodexSession));
+            controls.push(ProviderControl::Usage(UsageRow::CodexWeekly));
+        }
+        FocusedProvider::Cursor => {
+            controls.push(ProviderControl::Usage(UsageRow::CursorAuto));
+            controls.push(ProviderControl::Usage(UsageRow::CursorApi));
+        }
+    }
+    controls.push(ProviderControl::Close);
+    controls
+}
+
+#[derive(Clone, Copy)]
+enum ProviderControl {
+    Usage(UsageRow),
+    Close,
+}
+
+impl ProviderControl {
+    fn id(self) -> u16 {
+        match self {
+            Self::Usage(row) => PROVIDER_ID_BASE + 1 + row as u16,
+            Self::Close => PROVIDER_CLOSE_ID,
+        }
+    }
+}
+
+fn create_provider_children(parent: HWND, state: &mut ProviderDialogState, instance: HINSTANCE) {
+    for control in provider_row_ids(state.provider) {
+        let style = if matches!(control, ProviderControl::Close) {
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32)
+        } else {
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32)
+        };
+        let hwnd = create_child(parent, w!("BUTTON"), "", style, control.id(), instance);
+        if !state.font.is_invalid() {
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_SETFONT,
+                    WPARAM(state.font.0 as usize),
+                    LPARAM(1),
+                );
+            }
+        }
+        state.controls.push((control.id(), hwnd));
+    }
+}
+
+fn sync_provider_hwnd(hwnd: HWND) {
+    let Some(_guard) = SyncGuard::enter() else {
+        return;
+    };
+    let view = SettingsView::read();
+    let Some(state) = provider_state_mut(hwnd) else {
+        return;
+    };
+    set_text(hwnd, &provider_dialog_title(state.provider));
+    let strings = view.strings();
+    let dpi = state.dpi;
+    let pad = px(dpi, PAD);
+    let width = px(dpi, 360);
+    let mut y = pad;
+    let rows = provider_row_ids(state.provider);
+    if rows.len() == 1 {
+        // Claude: display toggle lives on the Models tab.
+        let note = create_or_find_provider_note(hwnd, state);
+        set_text(
+            note,
+            tr(
+                view.language,
+                "표시 여부는 모델 탭에서 변경합니다.",
+                "Use the Models tab to show or hide this provider.",
+            ),
+        );
+        place(note, pad, y, width, px(dpi, 40), true);
+        y += px(dpi, 48);
+    }
+    for control in rows {
+        let Some((_, ctrl)) = state
+            .controls
+            .iter()
+            .find(|(id, _)| *id == control.id())
+            .copied()
+        else {
+            continue;
+        };
+        match control {
+            ProviderControl::Usage(row) => {
+                let toggle = view.usage_row(row);
+                let label = match row {
+                    UsageRow::CodexSession | UsageRow::CodexWeekly => {
+                        let full = row.label(strings);
+                        full.split_once(' ')
+                            .map(|(_, kind)| kind.to_string())
+                            .unwrap_or(full)
+                    }
+                    UsageRow::CursorAuto => strings.cursor_auto_model.to_string(),
+                    UsageRow::CursorApi => strings.cursor_api_model.to_string(),
+                };
+                set_text(ctrl, &label);
+                set_checked(ctrl, toggle.checked);
+                let _ = unsafe { EnableWindow(ctrl, toggle.enabled) };
+                place(ctrl, pad, y, width, px(dpi, 22), true);
+                y += px(dpi, 26);
+            }
+            ProviderControl::Close => {
+                set_text(ctrl, "Close");
+                place(ctrl, pad, y + pad / 2, width, px(dpi, 28), true);
+                y += px(dpi, 28) + pad;
+            }
+        }
+    }
+    y += pad;
+    size_provider_dialog(hwnd, state, pad * 2 + width, y);
+}
+
+fn create_or_find_provider_note(parent: HWND, state: &mut ProviderDialogState) -> HWND {
+    const NOTE_ID: u16 = PROVIDER_ID_BASE + 50;
+    if let Some((_, hwnd)) = state.controls.iter().find(|(id, _)| *id == NOTE_ID) {
+        return *hwnd;
+    }
+    let instance = unsafe { GetModuleHandleW(PCWSTR::null()) }
+        .map(|module| HINSTANCE(module.0))
+        .unwrap_or_default();
+    let hwnd = create_child(parent, w!("STATIC"), "", WS_CHILD | WS_VISIBLE, NOTE_ID, instance);
+    if !state.font.is_invalid() {
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_SETFONT,
+                WPARAM(state.font.0 as usize),
+                LPARAM(1),
+            );
+        }
+    }
+    state.controls.push((NOTE_ID, hwnd));
+    hwnd
+}
+
+fn size_provider_dialog(hwnd: HWND, state: &ProviderDialogState, client_w: i32, client_h: i32) {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: client_w,
+        bottom: client_h,
+    };
+    let (style, ex_style) = unsafe {
+        (
+            WINDOW_STYLE(GetWindowLongW(hwnd, GWL_STYLE) as u32),
+            WINDOW_EX_STYLE(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32),
+        )
+    };
+    unsafe {
+        let _ = AdjustWindowRectExForDpi(&mut rect, style, false, ex_style, state.dpi);
+    }
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    let (x, y) = center_on_widget(state.owner, width, height);
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+}
+
+fn on_provider_command(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if SYNCING.with(|flag| flag.get()) {
+        return LRESULT(0);
+    }
+    let id = (wparam.0 & 0xffff) as u16;
+    let code = ((wparam.0 >> 16) & 0xffff) as u16;
+    if code != BN_CLICKED as u16 {
+        return LRESULT(0);
+    }
+    if id == PROVIDER_CLOSE_ID || id == IDCANCEL.0 as u16 || id == IDOK.0 as u16 {
+        let _ = unsafe { DestroyWindow(hwnd) };
+        return LRESULT(0);
+    }
+    let Some(state) = provider_state_mut(hwnd) else {
+        return LRESULT(0);
+    };
+    let widget = state.widget;
+    let control = HWND(lparam.0 as *mut _);
+    let shown = is_checked(control);
+    let command = UsageRow::ALL
+        .into_iter()
+        .find(|row| PROVIDER_ID_BASE + 1 + *row as u16 == id)
+        .map(|row| SettingsCommand::SetUsageRowShown(row, shown));
+    if let Some(command) = command {
+        super::settings::apply(widget, command);
+        sync();
+    }
+    LRESULT(0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -1220,11 +1865,11 @@ mod tests {
     use windows::Win32::UI::Controls::BST_CHECKED;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetActiveWindow, IsWindowEnabled, SetActiveWindow, SetFocus, VK_ESCAPE, VK_RETURN,
+        GetActiveWindow, SetActiveWindow, SetFocus, VK_ESCAPE, VK_RETURN,
     };
 
-    use super::super::settings::{PollInterval, SettingsCommand, SettingsView};
-    use super::super::{FocusedProvider, CURRENT_DPI};
+    use super::super::settings::{AlertThreshold, PollInterval, SettingsCommand, SettingsView};
+    use super::super::CURRENT_DPI;
     use super::*;
     use crate::native_interop;
 
@@ -1239,7 +1884,6 @@ mod tests {
             seen[field.index()] = true;
         }
         assert!(Field::from_control_id(1).is_none());
-        assert!(Field::from_control_id(2).is_none());
         assert_eq!(px(96, 12), 12);
         assert_eq!(px(192, 12), 24);
     }
@@ -1295,17 +1939,11 @@ mod tests {
                 WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_CLIPCHILDREN.0
             );
             assert_eq!(ex_style & WS_EX_CONTROLPARENT.0, WS_EX_CONTROLPARENT.0);
-            assert_eq!(ex_style & WS_EX_DLGMODALFRAME.0, WS_EX_DLGMODALFRAME.0);
-            assert_eq!(
-                ex_style & (WS_EX_LAYERED.0 | WS_EX_NOACTIVATE.0 | WS_EX_APPWINDOW.0),
-                0
-            );
             let owner = GetWindow(dialog, GW_OWNER).unwrap_or_default();
             assert!(
                 owner == widget || owner == host,
                 "owner={owner:?} widget={widget:?} host={host:?}"
             );
-            assert!(!MonitorFromWindow(dialog, MONITOR_DEFAULTTONEAREST).is_invalid());
 
             let _ = SetActiveWindow(dialog);
             let _ = SetFocus(dialog);
@@ -1315,76 +1953,45 @@ mod tests {
                 let control = GetDlgItem(dialog, field.control_id() as i32).unwrap();
                 assert!(GetDlgCtrlID(control) >= CONTROL_ID_BASE as i32);
             }
-            let view = SettingsView::read();
-            let display = GetDlgItem(dialog, Field::Display.control_id() as i32).unwrap();
-            assert_eq!(IsWindowVisible(display).as_bool(), view.displays.len() > 1);
+            let tab = GetDlgItem(dialog, TAB_CONTROL_ID as i32).unwrap();
+            assert!(IsWindow(tab).as_bool());
 
-            let claude = GetDlgItem(
-                dialog,
-                Field::Provider(FocusedProvider::ClaudeCode).control_id() as i32,
-            )
-            .unwrap();
-            let codex = GetDlgItem(
-                dialog,
-                Field::Provider(FocusedProvider::Codex).control_id() as i32,
-            )
-            .unwrap();
-            if !view.claude_available() {
-                assert!(!IsWindowEnabled(claude).as_bool());
+            // Switch to Refresh tab so poll/adaptive are laid out and visible.
+            SendMessageW(tab, TCM_SETCURSEL, WPARAM(Tab::Refresh.index()), LPARAM(0));
+            if let Some(state) = state_mut(dialog) {
+                state.active_tab = Tab::Refresh;
+                layout(dialog, state, &SettingsView::read());
             }
-            assert!(IsWindowEnabled(codex).as_bool());
 
             let poll = GetDlgItem(dialog, Field::PollInterval.control_id() as i32).unwrap();
+            assert!(
+                SendMessageW(poll, CB_GETCOUNT, WPARAM(0), LPARAM(0)).0
+                    >= PollInterval::ALL.len() as isize
+            );
             SendMessageW(poll, CB_SETCURSEL, WPARAM(0), LPARAM(0));
-            let polled = Field::PollInterval.command(&view, poll);
+            let polled = Field::PollInterval.command(&SettingsView::read(), poll);
             assert_eq!(
                 polled,
                 Some(SettingsCommand::SetPollInterval(PollInterval::OneMinute))
             );
             notify(dialog, Field::PollInterval, poll, CBN_SELCHANGE);
-            let restored = PollInterval::ALL
-                .iter()
-                .position(|interval| *interval == SettingsView::read().poll_interval)
-                .unwrap();
-            assert_eq!(
-                SendMessageW(poll, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0,
-                restored as isize
-            );
 
-            let adaptive = GetDlgItem(dialog, Field::AdaptiveRefresh.control_id() as i32).unwrap();
-            SendMessageW(adaptive, BM_SETCHECK, WPARAM(0), LPARAM(0));
-            assert_eq!(
-                Field::AdaptiveRefresh.command(&SettingsView::read(), adaptive),
-                Some(SettingsCommand::SetAdaptiveRefresh(false))
-            );
-            notify(dialog, Field::AdaptiveRefresh, adaptive, BN_CLICKED);
-            assert_eq!(
-                SendMessageW(adaptive, BM_GETCHECK, WPARAM(0), LPARAM(0)).0,
-                if SettingsView::read().adaptive_refresh {
-                    BST_CHECKED.0 as isize
-                } else {
-                    0
-                }
+            // Alerts tab: quota combo must list every threshold.
+            SendMessageW(tab, TCM_SETCURSEL, WPARAM(Tab::Alerts.index()), LPARAM(0));
+            if let Some(state) = state_mut(dialog) {
+                state.active_tab = Tab::Alerts;
+                layout(dialog, state, &SettingsView::read());
+            }
+            let alert = GetDlgItem(dialog, Field::AlertThreshold.control_id() as i32).unwrap();
+            assert!(
+                SendMessageW(alert, CB_GETCOUNT, WPARAM(0), LPARAM(0)).0
+                    >= AlertThreshold::ALL.len() as isize
             );
 
             let dpi = GetDpiForWindow(dialog).max(96);
             let mut client = RECT::default();
             GetClientRect(dialog, &mut client).unwrap();
             assert_eq!(client.right, px(dpi, PAD) * 2 + px(dpi, CLIENT_WIDTH));
-            let mut window_rect = RECT::default();
-            GetWindowRect(dialog, &mut window_rect).unwrap();
-            let monitor = MonitorFromWindow(dialog, MONITOR_DEFAULTTONEAREST);
-            let mut info = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            assert!(GetMonitorInfoW(monitor, &mut info).as_bool());
-            let dialog_height = window_rect.bottom - window_rect.top;
-            let work_height = info.rcWork.bottom - info.rcWork.top;
-            assert!(
-                dialog_height <= work_height,
-                "dialog height {dialog_height} exceeds work area {work_height}"
-            );
             assert_eq!(CURRENT_DPI.load(Ordering::Relaxed), dpi_before);
 
             let def_id = SendMessageW(dialog, DM_GETDEFID, WPARAM(0), LPARAM(0)).0 as u32;
@@ -1397,12 +2004,6 @@ mod tests {
             open(widget);
             let reopened = DIALOG.with(|cell| cell.get());
             assert!(IsWindow(reopened).as_bool());
-            assert_ne!(reopened, dialog);
-            let adaptive =
-                GetDlgItem(reopened, Field::AdaptiveRefresh.control_id() as i32).unwrap();
-            let checked = SendMessageW(adaptive, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
-                == BST_CHECKED.0 as isize;
-            assert_eq!(checked, SettingsView::read().adaptive_refresh);
             assert!(pre_translate(&key_message(reopened, VK_ESCAPE.0)));
             assert!(!IsWindow(reopened).as_bool());
         }
@@ -1433,6 +2034,7 @@ mod tests {
     impl Drop for CloseWindows {
         fn drop(&mut self) {
             unsafe {
+                close_provider_dialog();
                 let dialog = DIALOG.with(|cell| cell.get());
                 if IsWindow(dialog).as_bool() {
                     let _ = DestroyWindow(dialog);
