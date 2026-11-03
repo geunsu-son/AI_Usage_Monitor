@@ -696,10 +696,10 @@ fn effects_for_command(
             }
             after.alert = *threshold;
             effects.save = true;
+            // Changing the percent only updates the threshold. Already-sent
+            // keys stay until Off clears them or the next resets_at window.
             if *threshold == AlertThreshold::Off {
                 effects.clear_notified = true;
-            } else {
-                effects.notify = true;
             }
         }
         SettingsCommand::SetAppearance(appearance) => {
@@ -1171,7 +1171,7 @@ fn poll_retime_runs_only_after_a_poll_result() {
 
 #[cfg(test)]
 #[test]
-fn alert_off_clears_notified_windows_and_a_new_threshold_notifies() {
+fn alert_off_clears_notified_windows_and_a_new_threshold_does_not_notify() {
     let before = sample_snapshot();
     let off = effects_for(
         &Change::Pure(SettingsCommand::SetAlertThreshold(AlertThreshold::Off)),
@@ -1188,8 +1188,9 @@ fn alert_off_clears_notified_windows_and_a_new_threshold_notifies() {
         &before,
         facts(false, true),
     );
-    assert!(raised.effects.notify);
+    assert!(!raised.effects.notify);
     assert!(!raised.effects.clear_notified);
+    assert!(raised.effects.save);
     assert_eq!(raised.after.alert, AlertThreshold::Twenty);
 
     let same = effects_for(
