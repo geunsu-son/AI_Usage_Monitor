@@ -1,0 +1,54 @@
+# AI Usage Monitor
+
+[한국어](README.md) | **English**
+
+Windows taskbar widget that shows **remaining** Codex and optional Cursor quota (session and weekly windows).
+
+## Credits / reference repositories
+
+This project was built with reference to the open-source projects below. Full notices and licenses are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+| Repository | What we used |
+|---|---|
+| [upstream-ray/codex-usage-monitor](https://github.com/upstream-ray/codex-usage-monitor) | Win32 taskbar widget, tray, polling, and recovery (foundation) |
+| [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) | Upstream lineage of upstream-ray (metadata attribution) |
+| [lch5518/CodexPeek](https://github.com/lch5518/CodexPeek) | Codex `app-server --stdio` session handling |
+| [poweruserz/OpenTokenUsage](https://github.com/poweruserz/OpenTokenUsage) | Cursor request shape documentation (no source copied) |
+
+This is a standalone repository (not attached to a GitHub fork network). Copyright and MIT permission notices are retained as required.
+
+## Build
+
+Requires [Rust](https://rustup.rs/) (MSVC toolchain) and Visual Studio Build Tools with the C++ workload.
+
+```powershell
+cargo build --release
+```
+
+The binary is `target\release\ai-usage-monitor.exe`.
+
+### Verify providers (no GUI)
+
+```powershell
+cargo build
+.\target\debug\ai-usage-monitor.exe --probe all
+```
+
+Results are appended to `%TEMP%\ai-usage-probe.txt`. Codex needs the OpenAI Codex CLI installed (typically under `%LOCALAPPDATA%\OpenAI\Codex\bin\codex.exe`). Cursor needs the desktop app signed in.
+
+## Usage
+
+- **Codex**: uses `codex app-server --stdio` (same approach as [CodexPeek](https://github.com/lch5518/CodexPeek)); sign in with the Codex CLI if prompted.
+- **Cursor**: on by default when signed in. Toggle it from the tray **Models** menu. Reads `%APPDATA%\Cursor\User\globalStorage\state.vscdb` read-only and calls `api2.cursor.sh`. The widget shows **Auto** (included models) and **API** (external model) allowances; with only Cursor enabled, row labels use your locale (e.g. 자체 모델 / 외부 모델 in Korean).
+
+Settings and mutex names use the `AIUsageMonitor` prefix so this app can run beside the upstream Codex-only monitor.
+
+## Docs
+
+- [DESIGN.md](docs/DESIGN.md)
+- [IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)
+- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+
+## License
+
+MIT — see [LICENSE](LICENSE).
