@@ -1,14 +1,5 @@
-mod dutch;
 mod english;
-mod french;
-mod german;
-mod japanese;
 mod korean;
-mod portuguese_brazil;
-mod russian;
-mod simplified_chinese;
-mod spanish;
-mod traditional_chinese;
 
 use windows::core::PWSTR;
 use windows::Win32::Globalization::{
@@ -19,94 +10,37 @@ use windows::Win32::Globalization::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LanguageId {
     English,
-    Dutch,
-    Spanish,
-    French,
-    German,
-    Japanese,
     Korean,
-    SimplifiedChinese,
-    TraditionalChinese,
-    Russian,
-    PortugueseBrazil,
 }
 
 impl LanguageId {
-    pub const ALL: [LanguageId; 11] = [
-        LanguageId::English,
-        LanguageId::Dutch,
-        LanguageId::Spanish,
-        LanguageId::French,
-        LanguageId::German,
-        LanguageId::Japanese,
-        LanguageId::Korean,
-        LanguageId::SimplifiedChinese,
-        LanguageId::TraditionalChinese,
-        LanguageId::Russian,
-        LanguageId::PortugueseBrazil,
-    ];
+    pub const ALL: [LanguageId; 2] = [LanguageId::English, LanguageId::Korean];
 
     pub fn code(self) -> &'static str {
         match self {
             Self::English => "en",
-            Self::Dutch => "nl",
-            Self::Spanish => "es",
-            Self::French => "fr",
-            Self::German => "de",
-            Self::Japanese => "ja",
             Self::Korean => "ko",
-            Self::SimplifiedChinese => "zh-CN",
-            Self::TraditionalChinese => "zh-TW",
-            Self::Russian => "ru",
-            Self::PortugueseBrazil => "pt-BR",
         }
     }
 
     pub fn native_name(self) -> &'static str {
         match self {
             Self::English => "English",
-            Self::Dutch => "Nederlands",
-            Self::Spanish => "Español",
-            Self::French => "Français",
-            Self::German => "Deutsch",
-            Self::Japanese => "日本語",
             Self::Korean => "한국어",
-            Self::SimplifiedChinese => "简体中文",
-            Self::TraditionalChinese => "繁體中文",
-            Self::Russian => "Русский",
-            Self::PortugueseBrazil => "Português (Brasil)",
         }
     }
 
     pub fn strings(self) -> Strings {
         match self {
             Self::English => english::STRINGS,
-            Self::Dutch => dutch::STRINGS,
-            Self::Spanish => spanish::STRINGS,
-            Self::French => french::STRINGS,
-            Self::German => german::STRINGS,
-            Self::Japanese => japanese::STRINGS,
             Self::Korean => korean::STRINGS,
-            Self::SimplifiedChinese => simplified_chinese::STRINGS,
-            Self::TraditionalChinese => traditional_chinese::STRINGS,
-            Self::Russian => russian::STRINGS,
-            Self::PortugueseBrazil => portuguese_brazil::STRINGS,
         }
     }
 
     pub fn update_via_winget_label(self) -> &'static str {
         match self {
             Self::English => english::UPDATE_VIA_WINGET_LABEL,
-            Self::Dutch => dutch::UPDATE_VIA_WINGET_LABEL,
-            Self::Spanish => spanish::UPDATE_VIA_WINGET_LABEL,
-            Self::French => french::UPDATE_VIA_WINGET_LABEL,
-            Self::German => german::UPDATE_VIA_WINGET_LABEL,
-            Self::Japanese => japanese::UPDATE_VIA_WINGET_LABEL,
             Self::Korean => korean::UPDATE_VIA_WINGET_LABEL,
-            Self::SimplifiedChinese => simplified_chinese::UPDATE_VIA_WINGET_LABEL,
-            Self::TraditionalChinese => traditional_chinese::UPDATE_VIA_WINGET_LABEL,
-            Self::Russian => russian::UPDATE_VIA_WINGET_LABEL,
-            Self::PortugueseBrazil => portuguese_brazil::UPDATE_VIA_WINGET_LABEL,
         }
     }
 
@@ -119,24 +53,7 @@ impl LanguageId {
         let prefix = normalized.split('-').next().unwrap_or_default();
         match prefix {
             "en" => Some(Self::English),
-            "nl" => Some(Self::Dutch),
-            "es" => Some(Self::Spanish),
-            "fr" => Some(Self::French),
-            "de" => Some(Self::German),
-            "ja" => Some(Self::Japanese),
             "ko" => Some(Self::Korean),
-            "zh" => {
-                if normalized.contains("tw")
-                    || normalized.contains("hk")
-                    || normalized.contains("hant")
-                {
-                    Some(Self::TraditionalChinese)
-                } else {
-                    Some(Self::SimplifiedChinese)
-                }
-            }
-            "ru" => Some(Self::Russian),
-            "pt" => Some(Self::PortugueseBrazil),
             _ => None,
         }
     }
@@ -147,35 +64,18 @@ mod tests {
     use super::LanguageId;
 
     #[test]
-    fn parses_simplified_chinese_locales() {
-        assert_eq!(
-            LanguageId::from_code("zh-CN"),
-            Some(LanguageId::SimplifiedChinese)
-        );
-        assert_eq!(
-            LanguageId::from_code("zh_SG"),
-            Some(LanguageId::SimplifiedChinese)
-        );
-        assert_eq!(
-            LanguageId::from_code("zh-Hans"),
-            Some(LanguageId::SimplifiedChinese)
-        );
+    fn parses_supported_locales() {
+        assert_eq!(LanguageId::from_code("en"), Some(LanguageId::English));
+        assert_eq!(LanguageId::from_code("en-US"), Some(LanguageId::English));
+        assert_eq!(LanguageId::from_code("ko"), Some(LanguageId::Korean));
+        assert_eq!(LanguageId::from_code("ko-KR"), Some(LanguageId::Korean));
     }
 
     #[test]
-    fn preserves_traditional_chinese_locales() {
-        assert_eq!(
-            LanguageId::from_code("zh-TW"),
-            Some(LanguageId::TraditionalChinese)
-        );
-        assert_eq!(
-            LanguageId::from_code("zh-HK"),
-            Some(LanguageId::TraditionalChinese)
-        );
-        assert_eq!(
-            LanguageId::from_code("zh-Hant"),
-            Some(LanguageId::TraditionalChinese)
-        );
+    fn unsupported_locales_return_none() {
+        assert_eq!(LanguageId::from_code("zh-CN"), None);
+        assert_eq!(LanguageId::from_code("ja"), None);
+        assert_eq!(LanguageId::from_code("nl"), None);
     }
 }
 

@@ -144,13 +144,13 @@ impl History {
     pub fn description(
         &self,
         now: SystemTime,
-        chinese: bool,
+        korean: bool,
         last_poll_ok: bool,
         interval_ms: u32,
     ) -> String {
         let Some(last) = self.last_success else {
-            return if chinese {
-                "等待首次成功更新。"
+            return if korean {
+                "첫 번째 성공적인 업데이트를 기다리는 중입니다."
             } else {
                 "Waiting for the first successful update."
             }
@@ -161,33 +161,33 @@ impl History {
             .map(|t| format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond))
             .unwrap_or_else(|| "--".into());
         let cadence = if interval_ms < 60_000 {
-            if chinese {
-                format!("{} 秒", interval_ms / 1000)
+            if korean {
+                format!("{}초", interval_ms / 1000)
             } else {
                 format!("{} sec", interval_ms / 1000)
             }
-        } else if chinese {
-            format!("{} 分钟", interval_ms / 60_000)
+        } else if korean {
+            format!("{}분", interval_ms / 60_000)
         } else {
             format!("{} min", interval_ms / 60_000)
         };
-        let mut result = if chinese {
+        let mut result = if korean {
             format!(
-                "数字表示剩余额度。\n上次成功更新：{time}（{age} 分钟前）\n当前刷新间隔：{cadence}。"
+                "숫자는 남은 할당량을 나타냅니다.\n마지막 성공 업데이트: {time} ({age}분 전)\n현재 새로고침 간격: {cadence}."
             )
         } else {
             format!("Numbers indicate quota used.\nLast successful update: {time} ({age} min ago)\nCurrent refresh interval: {cadence}.")
         };
         if !last_poll_ok {
-            result.push_str(if chinese {
-                "\n最近更新失败，正在等待重试或重新登录。"
+            result.push_str(if korean {
+                "\n최근 업데이트가 실패했습니다. 재시도 또는 다시 로그인을 기다리는 중입니다."
             } else {
                 "\nThe latest update failed; awaiting retry or sign-in."
             });
         }
         if self.is_stale(now) {
-            result.push_str(if chinese {
-                "\n* 数据已过期，请刷新确认。"
+            result.push_str(if korean {
+                "\n* 데이터가 오래되었습니다. 새로고침하여 확인하세요."
             } else {
                 "\n* Data is stale; refresh to confirm."
             });
@@ -321,7 +321,7 @@ mod tests {
         let mut history = History::default();
         history.record_success(SystemTime::now(), 60_000);
         let text = history.description(SystemTime::now(), true, false, 30_000);
-        assert!(text.contains("30 秒"));
-        assert!(!text.contains("0 分钟。"));
+        assert!(text.contains("30초"));
+        assert!(!text.contains("간격: 0분"));
     }
 }

@@ -7,7 +7,7 @@ use crate::native_interop::{self, Color};
 
 const DIGIT_CELL: i32 = 8;
 const PERCENT_CELL: i32 = 12;
-const COLUMN_GAP: i32 = 8;
+const COLUMN_GAP: i32 = 6;
 /// Cell widths are tuned for 12 px text and grow with larger text.
 const BASE_FONT_PX: i32 = 12;
 
@@ -29,9 +29,9 @@ pub fn reset_offset(font_px: i32) -> i32 {
     percent_width(font_px) + COLUMN_GAP
 }
 
-/// `height` is in physical pixels.
-pub unsafe fn create_reset_font(height: i32) -> HFONT {
-    let face = native_interop::wide_str("Microsoft YaHei UI");
+/// `height` is in physical pixels. `face` is a Windows font family name.
+pub unsafe fn create_reset_font(height: i32, face: &str) -> HFONT {
+    let face = native_interop::wide_str(face);
     CreateFontW(
         -height,
         0,
@@ -95,6 +95,7 @@ pub fn draw(
     primary: &Color,
     secondary: &Color,
     font_px: i32,
+    font_face: &str,
     scale: impl Fn(i32) -> i32,
 ) {
     let (percentage, reset) = parts(value);
@@ -141,7 +142,7 @@ pub fn draw(
 
     let reset_x = x + scale(reset_offset(font_px));
     unsafe {
-        let font = create_reset_font(scale(font_px));
+        let font = create_reset_font(scale(font_px), font_face);
         let old_font = SelectObject(hdc, font);
         let _ = SetTextColor(hdc, COLORREF(secondary.to_colorref()));
         text(
@@ -165,9 +166,9 @@ mod tests {
 
     #[test]
     fn larger_text_widens_cells_without_moving_standard_columns() {
-        assert_eq!(reset_offset(12), 8 * 3 + 12 + 8);
+        assert_eq!(reset_offset(12), 8 * 3 + 12 + 6);
         assert_eq!(cell(DIGIT_CELL, 13), 9);
-        assert_eq!(reset_offset(13), 9 * 3 + 13 + 8);
+        assert_eq!(reset_offset(13), 9 * 3 + 13 + 6);
     }
 
     #[test]

@@ -25,10 +25,14 @@ static STATE: Mutex<State> = Mutex::new(State {
 // the standard tooltip control accepts these TOOLINFO structures.
 const TOOL_INFO_SIZE: u32 = std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32;
 
-pub fn message(chinese: bool, weekly: bool) -> &'static str {
-    match (chinese, weekly) {
-        (true, false) => "账号未提供 5 小时限额；-- 表示无该窗口的数据，并非剩余 100%。",
-        (true, true) => "账号未提供每周限额；-- 表示无该窗口的数据，并非剩余 100%。",
+pub fn message(korean: bool, weekly: bool) -> &'static str {
+    match (korean, weekly) {
+        (true, false) => {
+            "계정에서 5시간 할당량을 제공하지 않습니다. --는 해당 창의 데이터가 없음을 의미하며, 남은 100%를 뜻하지 않습니다."
+        }
+        (true, true) => {
+            "계정에서 주간 할당량을 제공하지 않습니다. --는 해당 창의 데이터가 없음을 의미하며, 남은 100%를 뜻하지 않습니다."
+        }
         (false, false) => {
             "The account does not report a 5-hour quota. -- means unavailable, not 100% remaining."
         }

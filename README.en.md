@@ -2,7 +2,12 @@
 
 [한국어](README.md) | **English**
 
+![Windows](https://img.shields.io/badge/platform-Windows-blue)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Windows taskbar widget that shows **remaining** Codex and optional Cursor quota (session and weekly windows).
+
+![AI Usage Monitor running in the Windows taskbar](.github/animation.gif)
 
 ## Credits / reference repositories
 
@@ -16,6 +21,8 @@ This project was built with reference to the open-source projects below. Full no
 | [poweruserz/OpenTokenUsage](https://github.com/poweruserz/OpenTokenUsage) | Cursor request shape documentation (no source copied) |
 
 This is a standalone repository (not attached to a GitHub fork network). Copyright and MIT permission notices are retained as required.
+
+UI languages are limited to **Korean and English**.
 
 ## Build
 

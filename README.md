@@ -2,7 +2,12 @@
 
 **한국어** | [English](README.en.md)
 
+![Windows](https://img.shields.io/badge/platform-Windows-blue)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Windows 작업 표시줄에서 Codex·Cursor의 **잔여** 사용량(세션·주간 창)을 보여주는 위젯입니다.
+
+![AI Usage Monitor running in the Windows taskbar](.github/animation.gif)
 
 ## 참고한 저장소
 
@@ -16,6 +21,8 @@ Windows 작업 표시줄에서 Codex·Cursor의 **잔여** 사용량(세션·주
 | [poweruserz/OpenTokenUsage](https://github.com/poweruserz/OpenTokenUsage) | Cursor 요청 형식 문서 (코드 미복사) |
 
 GitHub fork 네트워크에 묶이지 않은 독립 저장소이며, MIT 조건에 맞춰 저작권·허가문을 남깁니다.
+
+UI 언어는 **한국어·영어**만 지원합니다.
 
 ## 빌드
 

@@ -330,13 +330,13 @@ impl Service {
     pub fn stale(&self, now: SystemTime) -> bool {
         self.error.is_some() || self.history.is_stale(now)
     }
-    pub fn description(&self, now: SystemTime, clock: Instant, chinese: bool) -> String {
+    pub fn description(&self, now: SystemTime, clock: Instant, korean: bool) -> String {
         let mut text =
             self.history
-                .description(now, chinese, self.error.is_none(), self.interval_ms);
+                .description(now, korean, self.error.is_none(), self.interval_ms);
         if self.in_flight.is_some() {
-            text.push_str(if chinese {
-                "\n正在刷新…"
+            text.push_str(if korean {
+                "\n새로고침 중…"
             } else {
                 "\nRefreshing…"
             });
@@ -348,52 +348,50 @@ impl Service {
                 .map(|t| format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond))
                 .unwrap_or_else(|| "--".into());
             let label = if self.auth.is_some() {
-                if chinese {
-                    "下次检查登录凭据"
+                if korean {
+                    "다음 자격 증명 확인"
                 } else {
                     "Next credential check"
                 }
             } else if self.error.is_some() {
-                if chinese {
-                    "下次重试"
+                if korean {
+                    "다음 재시도"
                 } else {
                     "Next retry"
                 }
+            } else if korean {
+                "다음 새로고침"
             } else {
-                if chinese {
-                    "下次刷新"
-                } else {
-                    "Next refresh"
-                }
+                "Next refresh"
             };
-            text.push_str(&format!("\n{label}：{time}"));
+            text.push_str(&format!("\n{label}: {time}"));
         }
         if let Some(error) = self.error {
-            let reason = if chinese {
+            let reason = if korean {
                 match error {
-                    PollError::AuthRequired => "需要重新登录",
-                    PollError::NoCredentials => "未找到登录凭据",
-                    PollError::TokenExpired => "登录已过期",
-                    PollError::NetworkUnavailable => "网络连接失败",
-                    PollError::RateLimited(_) => "请求过于频繁，正在退避",
-                    PollError::ServerError => "服务暂时不可用",
-                    PollError::RequestFailed => "无法读取额度响应",
+                    PollError::AuthRequired => "다시 로그인해야 합니다",
+                    PollError::NoCredentials => "로그인 자격 증명을 찾을 수 없습니다",
+                    PollError::TokenExpired => "로그인이 만료되었습니다",
+                    PollError::NetworkUnavailable => "네트워크 연결 실패",
+                    PollError::RateLimited(_) => "요청이 너무 많아 대기 중입니다",
+                    PollError::ServerError => "서비스를 일시적으로 사용할 수 없습니다",
+                    PollError::RequestFailed => "할당량 응답을 읽을 수 없습니다",
                 }
             } else {
                 error.category()
             };
             text.push_str(&format!(
                 "\n{}: {}",
-                if chinese {
-                    "最近请求失败"
+                if korean {
+                    "최근 요청 실패"
                 } else {
                     "Latest request failed"
                 },
                 reason
             ));
             if self.auth.is_some() {
-                text.push_str(if chinese {
-                    "\n已暂停接口重试，等待登录凭据更新；也可手动刷新。"
+                text.push_str(if korean {
+                    "\n자격 증명이 변경될 때까지 API 재시도가 일시 중지되었습니다. 수동 새로고침은 가능합니다."
                 } else {
                     "\nAPI retries paused until credentials change; manual refresh is available."
                 });
@@ -469,14 +467,14 @@ mod tests {
         let job = monitor.plan(now).remove(0);
         assert!(monitor.services[0]
             .description(wall, now, true)
-            .contains("正在刷新"));
+            .contains("새로고침 중"));
         assert!(monitor.services[0]
             .description(wall, now, false)
             .contains("Refreshing"));
         complete(&mut monitor, &job, Ok(usage(20.0)), now, wall);
         let description = monitor.services[0].description(wall, now, true);
-        assert!(description.contains("下次刷新："));
-        assert!(!description.contains("正在刷新"));
+        assert!(description.contains("다음 새로고침:"));
+        assert!(!description.contains("새로고침 중"));
         monitor.force(now, true);
         let job = monitor.plan(now).remove(0);
         complete(
@@ -488,13 +486,13 @@ mod tests {
         );
         assert!(monitor.services[0]
             .description(wall, now, true)
-            .contains("下次重试："));
+            .contains("다음 재시도:"));
         monitor.force(now, true);
         let job = monitor.plan(now).remove(0);
         complete(&mut monitor, &job, Err(PollError::NoCredentials), now, wall);
         assert!(monitor.services[0]
             .description(wall, now, true)
-            .contains("下次检查登录凭据："));
+            .contains("다음 자격 증명 확인:"));
     }
 
     #[test]
