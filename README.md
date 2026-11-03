@@ -7,8 +7,6 @@
 
 Windows 작업 표시줄에서 Codex·Cursor의 **잔여** 사용량(세션·주간 창)을 보여주는 위젯입니다.
 
-![AI Usage Monitor running in the Windows taskbar](.github/animation.gif)
-
 ## 참고한 저장소
 
 이 프로젝트는 아래 오픈소스의 설계·코드를 참고해 만들었습니다. 상세 고지와 라이선스는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)를 보세요.
