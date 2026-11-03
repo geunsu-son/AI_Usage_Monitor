@@ -1,4 +1,5 @@
 mod settings;
+mod settings_dialog;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -2252,6 +2253,9 @@ pub fn run() {
         // Message loop
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+            if settings_dialog::pre_translate(&msg) {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -3616,6 +3620,7 @@ unsafe extern "system" fn wnd_proc(
 #[derive(Clone)]
 enum MenuChoice {
     Setting(settings::SettingsCommand),
+    OpenSettings,
     Refresh,
     VersionAction,
     Exit,
@@ -3788,6 +3793,7 @@ fn show_context_menu(hwnd: HWND) {
     build_context_menu(&mut menu, &view, install_channel, &update_status);
     match menu.track(hwnd) {
         Some(MenuChoice::Setting(command)) => settings::apply(hwnd, command),
+        Some(MenuChoice::OpenSettings) => settings_dialog::open(hwnd),
         Some(MenuChoice::Refresh) => refresh_now(hwnd),
         Some(MenuChoice::VersionAction) => run_version_action(hwnd),
         Some(MenuChoice::Exit) => exit_app(),
@@ -3806,6 +3812,8 @@ fn build_context_menu(
     let strings = view.strings();
     let language = view.language;
 
+    menu.item("Open Settings", false, true, MenuChoice::OpenSettings);
+    menu.separator();
     menu.item(strings.refresh, false, true, MenuChoice::Refresh);
 
     menu.submenu(strings.update_frequency, |menu| {

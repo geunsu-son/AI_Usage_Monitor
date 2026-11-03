@@ -818,17 +818,18 @@ fn run_effects(widget: HWND, effects: Effects) {
 /// The state lock is dropped before `save_state_settings` and before any Win32
 /// call that can pump messages. `save_state_settings` takes the saves lock first.
 pub(super) fn apply(widget: HWND, command: SettingsCommand) {
-    let Some(change) = prepare(widget, command) else {
-        return;
-    };
-    let effects = {
-        let mut state = lock_state();
-        let Some(state) = state.as_mut() else {
-            return;
+    if let Some(change) = prepare(widget, command) {
+        let effects = {
+            let mut state = lock_state();
+            match state.as_mut() {
+                Some(state) => mutate(state, change),
+                None => Effects::default(),
+            }
         };
-        mutate(state, change)
-    };
-    run_effects(widget, effects);
+        run_effects(widget, effects);
+    }
+    // A rejected edit still resyncs so the open dialog snaps back to AppState.
+    super::settings_dialog::sync();
 }
 
 #[cfg(test)]
