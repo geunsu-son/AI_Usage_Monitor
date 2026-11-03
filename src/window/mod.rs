@@ -1786,26 +1786,19 @@ fn client_height(hwnd: HWND) -> i32 {
     sc(WIDGET_HEIGHT)
 }
 
-/// Two rows span the top of the upper bar through the bottom of the lower bar.
-/// One row matches the bar, and a slim bar stays at least `min_one_row` tall.
-fn provider_icon_size(
-    row_height: i32,
-    row_gap: i32,
-    bar_height: i32,
-    two_rows: bool,
-    min_one_row: i32,
-) -> i32 {
-    if two_rows {
-        row_height + row_gap + bar_height
-    } else {
-        bar_height.max(min_one_row)
-    }
+/// Always the two-row stack height (upper bar top → lower bar bottom), even
+/// when only one quota row is visible, so the mark does not shrink.
+fn provider_icon_size(row_height: i32, row_gap: i32, bar_height: i32) -> i32 {
+    row_height + row_gap + bar_height
 }
 
-fn column_icon_size(appearance: Appearance, row_gap: i32, upper: bool, lower: bool) -> i32 {
-    let bar = appearance.bar_height();
-    let full = provider_icon_size(appearance.row_height(), row_gap, bar, upper && lower, bar);
-    // Slightly under the bar stack so the mark does not dominate the fill.
+fn column_icon_size(appearance: Appearance, row_gap: i32, _upper: bool, _lower: bool) -> i32 {
+    let full = provider_icon_size(
+        appearance.row_height(),
+        row_gap,
+        appearance.bar_height(),
+    );
+    // Slightly under the two-row bar stack so the mark does not dominate.
     ((full * 90) / 100).max(1)
 }
 
@@ -4784,10 +4777,21 @@ mod tests {
     }
 
     #[test]
-    fn provider_icon_spans_two_bars_and_matches_one_bar() {
-        assert_eq!(provider_icon_size(18, 8, 13, true, 12), 18 + 8 + 13);
-        assert_eq!(provider_icon_size(18, 8, 13, false, 12), 13);
-        assert_eq!(provider_icon_size(18, 8, 8, false, 12), 12);
+    fn provider_icon_keeps_two_row_stack_height() {
+        assert_eq!(provider_icon_size(18, 8, 13), 18 + 8 + 13);
+        assert_eq!(provider_icon_size(18, 8, 8), 18 + 8 + 8);
+        assert_eq!(
+            column_icon_size(
+                Appearance {
+                    bar_thickness: BarThickness::Slim,
+                    ..Appearance::default()
+                },
+                8,
+                true,
+                false,
+            ),
+            ((18 + 8 + 8) * 90) / 100
+        );
     }
 
     #[test]
