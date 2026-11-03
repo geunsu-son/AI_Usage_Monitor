@@ -259,25 +259,42 @@ pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
 /// Embed our window as a child of the taskbar
 pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
     unsafe {
-        // Preserve existing extended style, add tool window + no activate
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        // Reset alpha mode used by the startup popup fallback before switching
-        // back to UpdateLayeredWindow rendering inside the taskbar.
-        if ex_style & WS_EX_LAYERED.0 as i32 != 0 {
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let already_child = style & WS_CHILD_STYLE != 0;
+
+        // Startup creates a layered popup with SetLayeredWindowAttributes. Clearing
+        // WS_EX_LAYERED once drops that alpha mode so UpdateLayeredWindow can take
+        // over. On later monitor moves the window is already a child using
+        // UpdateLayeredWindow; clearing LAYERED again wipes the bitmap and can leave
+        // an empty transparent window after SetParent.
+        if !already_child && ex_style & WS_EX_LAYERED.0 as i32 != 0 {
             let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !(WS_EX_LAYERED.0 as i32));
         }
         let _ = SetWindowLongW(
             hwnd,
             GWL_EXSTYLE,
-            ex_style | WS_EX_TOOLWINDOW.0 as i32 | WS_EX_NOACTIVATE.0 as i32,
+            ex_style
+                | WS_EX_TOOLWINDOW.0 as i32
+                | WS_EX_NOACTIVATE.0 as i32
+                | WS_EX_LAYERED.0 as i32,
         );
 
-        // Change from popup to child
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let new_style = (style & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
 
         let _ = SetParent(hwnd, taskbar_hwnd);
+        // Reparenting can bury the widget under ReBar/taskband siblings. Raise it and
+        // apply style changes so the layered child paints again on the new taskbar.
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+        );
     }
 }
 

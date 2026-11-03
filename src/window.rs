@@ -80,6 +80,8 @@ struct AppState {
     show_claude_code: bool,
     show_codex: bool,
     show_cursor: bool,
+    /// Which enabled provider the slim widget currently shows (left-click cycles).
+    focused_provider: FocusedProvider,
     show_session_window: bool,
     show_weekly_window: bool,
     alert_threshold_percent: u8,
@@ -362,9 +364,18 @@ enum BarStyle {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BarThickness {
-    #[default]
     Standard,
+    #[default]
     Slim,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FocusedProvider {
+    #[default]
+    Codex,
+    Cursor,
+    ClaudeCode,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -428,7 +439,7 @@ impl Appearance {
 struct SettingsFile {
     #[serde(default)]
     tray_offset: i32,
-    #[serde(default)]
+    #[serde(default = "default_anchor_left")]
     anchor_left: bool,
     #[serde(default)]
     taskbar_index: usize,
@@ -452,6 +463,8 @@ struct SettingsFile {
     show_codex: bool,
     #[serde(default = "default_show_cursor")]
     show_cursor: bool,
+    #[serde(default)]
+    focused_provider: FocusedProvider,
     #[serde(default = "default_show_usage_window")]
     show_session_window: bool,
     #[serde(default = "default_show_usage_window")]
@@ -466,7 +479,7 @@ impl Default for SettingsFile {
     fn default() -> Self {
         Self {
             tray_offset: 0,
-            anchor_left: false,
+            anchor_left: default_anchor_left(),
             taskbar_index: 0,
             monitor_device: None,
             poll_interval_ms: default_poll_interval(),
@@ -478,6 +491,7 @@ impl Default for SettingsFile {
             show_claude_code: false,
             show_codex: true,
             show_cursor: true,
+            focused_provider: FocusedProvider::default(),
             show_session_window: true,
             show_weekly_window: true,
             alert_threshold_percent: 0,
@@ -511,6 +525,10 @@ fn default_show_cursor() -> bool {
 }
 
 fn default_show_usage_window() -> bool {
+    true
+}
+
+fn default_anchor_left() -> bool {
     true
 }
 
@@ -611,6 +629,7 @@ fn save_state_settings() {
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_cursor: s.show_cursor,
+            focused_provider: s.focused_provider,
             show_session_window: s.show_session_window,
             show_weekly_window: s.show_weekly_window,
             alert_threshold_percent: s.alert_threshold_percent,
@@ -1017,8 +1036,14 @@ fn sync_usage_text_compact(taskbar_hwnd: HWND, taskbar_rect: RECT) -> bool {
         return false;
     };
     let want_compact = {
+        let (_claude, show_codex, show_cursor) = visible_provider_flags(
+            s.show_claude_code,
+            s.show_codex,
+            s.show_cursor,
+            s.focused_provider,
+        );
         let full = total_widget_width_for(
-            active_model_count(s.show_codex, s.show_cursor),
+            active_model_count(show_codex, show_cursor),
             s.language,
             s.appearance,
             false,
@@ -1626,10 +1651,11 @@ const WIDGET_HEIGHT: i32 = 46;
 /// Extra gap between widget right edge and system clock / tray.
 const TASKBAR_RESERVE_MARGIN: i32 = 16;
 
-fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
+fn is_drag_handle_point(client_x: i32, client_y: i32, client_height: i32) -> bool {
     let divider_h = sc(25);
-    let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
-    // Whole left gutter (divider + margin), not just the 3px stripe ? easier to grab.
+    let band = client_height.max(sc(WIDGET_HEIGHT));
+    let divider_top = (band - divider_h) / 2;
+    // Whole left gutter (divider + margin), not just the 3px stripe — easier to grab.
     let handle_w = sc(LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN);
     client_x >= 0
         && client_x < handle_w
@@ -1643,12 +1669,83 @@ fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
         if GetCursorPos(&mut pt).is_err() || !ScreenToClient(hwnd, &mut pt).as_bool() {
             return false;
         }
-        is_drag_handle_point(pt.x, pt.y)
+        let mut client = RECT::default();
+        let _ = GetClientRect(hwnd, &mut client);
+        is_drag_handle_point(pt.x, pt.y, client.bottom - client.top)
     }
 }
 
 fn active_model_count(show_codex: bool, show_cursor: bool) -> i32 {
     (show_codex as i32 + show_cursor as i32).max(1)
+}
+
+fn enabled_focus_targets(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_cursor: bool,
+) -> Vec<FocusedProvider> {
+    let mut targets = Vec::new();
+    if show_codex {
+        targets.push(FocusedProvider::Codex);
+    }
+    if show_cursor {
+        targets.push(FocusedProvider::Cursor);
+    }
+    if show_claude_code {
+        targets.push(FocusedProvider::ClaudeCode);
+    }
+    targets
+}
+
+fn normalize_focused_provider(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_cursor: bool,
+    focus: FocusedProvider,
+) -> FocusedProvider {
+    let targets = enabled_focus_targets(show_claude_code, show_codex, show_cursor);
+    if targets.contains(&focus) {
+        focus
+    } else {
+        targets
+            .into_iter()
+            .next()
+            .unwrap_or(FocusedProvider::Codex)
+    }
+}
+
+/// Slim widget shows one enabled provider at a time; left-click cycles focus.
+fn visible_provider_flags(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_cursor: bool,
+    focus: FocusedProvider,
+) -> (bool, bool, bool) {
+    let targets = enabled_focus_targets(show_claude_code, show_codex, show_cursor);
+    if targets.len() <= 1 {
+        return (show_claude_code, show_codex, show_cursor);
+    }
+    let focus = normalize_focused_provider(show_claude_code, show_codex, show_cursor, focus);
+    (
+        show_claude_code && focus == FocusedProvider::ClaudeCode,
+        show_codex && focus == FocusedProvider::Codex,
+        show_cursor && focus == FocusedProvider::Cursor,
+    )
+}
+
+fn cycle_focused_provider(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_cursor: bool,
+    focus: FocusedProvider,
+) -> Option<FocusedProvider> {
+    let targets = enabled_focus_targets(show_claude_code, show_codex, show_cursor);
+    if targets.len() < 2 {
+        return None;
+    }
+    let focus = normalize_focused_provider(show_claude_code, show_codex, show_cursor, focus);
+    let index = targets.iter().position(|t| *t == focus).unwrap_or(0);
+    Some(targets[(index + 1) % targets.len()])
 }
 
 fn quota_row_labels(
@@ -1811,8 +1908,14 @@ fn total_widget_width_for(
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
+    let (_claude, show_codex, show_cursor) = visible_provider_flags(
+        state.show_claude_code,
+        state.show_codex,
+        state.show_cursor,
+        state.focused_provider,
+    );
     total_widget_width_for(
-        active_model_count(state.show_codex, state.show_cursor),
+        active_model_count(show_codex, show_cursor),
         state.language,
         state.appearance,
         state.usage_text_compact,
@@ -1825,8 +1928,14 @@ fn total_widget_width() -> i32 {
         state
             .as_ref()
             .map(|s| {
+                let (_claude, show_codex, show_cursor) = visible_provider_flags(
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_cursor,
+                    s.focused_provider,
+                );
                 (
-                    active_model_count(s.show_codex, s.show_cursor),
+                    active_model_count(show_codex, show_cursor),
                     s.language,
                     s.appearance,
                     s.usage_text_compact,
@@ -2042,6 +2151,12 @@ pub fn run() {
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_cursor: settings.show_cursor,
+                focused_provider: normalize_focused_provider(
+                    settings.show_claude_code,
+                    settings.show_codex,
+                    settings.show_cursor,
+                    settings.focused_provider,
+                ),
                 show_session_window: settings.show_session_window,
                 show_weekly_window: settings.show_weekly_window,
                 alert_threshold_percent: settings.alert_threshold_percent,
@@ -2280,31 +2395,39 @@ fn render_layered() {
     ) = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) => (
-                s.hwnd,
-                s.is_dark,
-                s.embedded,
-                s.language,
-                s.appearance,
-                s.language.strings(),
-                s.session_percent,
-                s.session_text.clone(),
-                s.weekly_percent,
-                s.weekly_text.clone(),
-                s.codex_session_percent,
-                s.codex_session_text.clone(),
-                s.codex_weekly_percent,
-                s.codex_weekly_text.clone(),
-                s.cursor_session_percent,
-                s.cursor_session_text.clone(),
-                s.cursor_weekly_percent,
-                s.cursor_weekly_text.clone(),
-                s.show_claude_code,
-                s.show_codex,
-                s.show_cursor,
-                s.show_session_window,
-                s.show_weekly_window,
-            ),
+            Some(s) => {
+                let (show_claude_code, show_codex, show_cursor) = visible_provider_flags(
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_cursor,
+                    s.focused_provider,
+                );
+                (
+                    s.hwnd,
+                    s.is_dark,
+                    s.embedded,
+                    s.language,
+                    s.appearance,
+                    s.language.strings(),
+                    s.session_percent,
+                    s.session_text.clone(),
+                    s.weekly_percent,
+                    s.weekly_text.clone(),
+                    s.codex_session_percent,
+                    s.codex_session_text.clone(),
+                    s.codex_weekly_percent,
+                    s.codex_weekly_text.clone(),
+                    s.cursor_session_percent,
+                    s.cursor_session_text.clone(),
+                    s.cursor_weekly_percent,
+                    s.cursor_weekly_text.clone(),
+                    show_claude_code,
+                    show_codex,
+                    show_cursor,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                )
+            }
             None => return,
         }
     };
@@ -2431,7 +2554,7 @@ fn render_layered() {
             AlphaFormat: 1, // AC_SRC_ALPHA
         };
 
-        let _ = UpdateLayeredWindow(
+        if let Err(error) = UpdateLayeredWindow(
             hwnd,
             screen_dc,
             None,
@@ -2441,7 +2564,9 @@ fn render_layered() {
             COLORREF(0),
             Some(&blend),
             ULW_ALPHA,
-        );
+        ) {
+            diagnose::log_error("UpdateLayeredWindow failed", error);
+        }
 
         // Cleanup
         SelectObject(mem_dc, old_bmp);
@@ -2578,6 +2703,10 @@ fn paint_content(
         }
         if show_codex {
             provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Codex);
+            icon_x += model_width;
+        }
+        if show_cursor {
+            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Cursor);
         }
 
         let (row1_label, row2_label) = quota_row_labels(strings, show_codex, show_cursor);
@@ -3001,7 +3130,8 @@ fn position_at_taskbar() {
         save_state_settings();
     }
 
-    let widget_height = sc(WIDGET_HEIGHT).min(taskbar_height);
+    // Fill the taskbar band; paint centers content vertically inside this height.
+    let widget_height = taskbar_height.max(1);
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
@@ -3014,7 +3144,7 @@ fn position_at_taskbar() {
         ) - taskbar_rect.left;
         native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
         diagnose::log(format!(
-            "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
+            "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height} left={anchor_left}",
             y - taskbar_rect.top
         ));
     } else {
@@ -3028,7 +3158,7 @@ fn position_at_taskbar() {
         );
         native_interop::move_window(hwnd, x, y, widget_width, widget_height);
         diagnose::log(format!(
-            "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
+            "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height} left={anchor_left}"
         ));
     }
     if compact_changed {
@@ -3051,8 +3181,24 @@ fn compute_anchor_x(
 }
 
 fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> i32 {
-    let anchor_bottom = anchor_top + anchor_height;
-    (anchor_bottom - widget_height).max(anchor_top)
+    // Prefer filling the band (caller passes widget_height == anchor_height). If the
+    // window is shorter, center it so content sits mid-taskbar instead of on the bottom.
+    let y = anchor_top + (anchor_height - widget_height) / 2;
+    y.clamp(
+        anchor_top,
+        (anchor_top + anchor_height - widget_height).max(anchor_top),
+    )
+}
+
+/// Convert a screen-space widget left into tray-relative offset (0 = flush to tray).
+fn tray_offset_from_screen_left(
+    taskbar_left: i32,
+    tray_left: i32,
+    widget_width: i32,
+    screen_left: i32,
+) -> i32 {
+    let offset = tray_left - widget_width - screen_left;
+    offset.clamp(0, (tray_left - taskbar_left - widget_width).max(0))
 }
 
 /// WinEvent callback for tray icon location changes
@@ -3255,7 +3401,34 @@ unsafe extern "system" fn wnd_proc(
         WM_LBUTTONDOWN => {
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
             let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            if !is_drag_handle_point(client_x, client_y) {
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let client_height = client.bottom - client.top;
+            if !is_drag_handle_point(client_x, client_y, client_height) {
+                // Left-click the usage area to cycle the focused provider.
+                let cycled = {
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        if let Some(next) = cycle_focused_provider(
+                            s.show_claude_code,
+                            s.show_codex,
+                            s.show_cursor,
+                            s.focused_provider,
+                        ) {
+                            s.focused_provider = next;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if cycled {
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                }
                 return LRESULT(0);
             }
 
@@ -3263,8 +3436,24 @@ unsafe extern "system" fn wnd_proc(
             let _ = GetCursorPos(&mut pt);
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
+                // Left-pin is the default home position; dragging unlocks it.
                 if s.anchor_left {
-                    return LRESULT(0);
+                    if let Some(taskbar_hwnd) = s.taskbar_hwnd {
+                        if let Some(taskbar_rect) =
+                            native_interop::get_taskbar_rect(taskbar_hwnd)
+                        {
+                            let reserve =
+                                taskbar_widget_reserve_left(taskbar_hwnd, taskbar_rect);
+                            let width = total_widget_width_for_state(s);
+                            s.tray_offset = tray_offset_from_screen_left(
+                                taskbar_rect.left,
+                                reserve,
+                                width,
+                                taskbar_rect.left,
+                            );
+                        }
+                    }
+                    s.anchor_left = false;
                 }
                 s.dragging = true;
                 s.drag_start_mouse_x = pt.x;
@@ -3293,7 +3482,7 @@ unsafe extern "system" fn wnd_proc(
                     let delta = s.drag_start_mouse_x - pt.x;
                     let mut new_offset = s.drag_start_offset + delta;
 
-                    // Clamp: offset >= 0 (can't go right of default)
+                    // Clamp: offset >= 0 (can't go right of the tray-side default)
                     if new_offset < 0 {
                         new_offset = 0;
                     }
@@ -3319,12 +3508,19 @@ unsafe extern "system" fn wnd_proc(
                             let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
                             let anchor_top = taskbar_rect.top;
                             let anchor_height = taskbar_height;
-                            let widget_height = sc(WIDGET_HEIGHT).min(taskbar_height);
+                            let widget_height = taskbar_height.max(1);
                             let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
+                            let screen_x = compute_anchor_x(
+                                taskbar_rect.left,
+                                reserve_left,
+                                widget_width,
+                                new_offset,
+                                false,
+                            );
                             let x = if embedded {
-                                reserve_left - taskbar_rect.left - widget_width - new_offset
+                                screen_x - taskbar_rect.left
                             } else {
-                                reserve_left - widget_width - new_offset
+                                screen_x
                             };
                             Some((
                                 hwnd_val,
@@ -3479,7 +3675,7 @@ unsafe extern "system" fn wnd_proc(
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.tray_offset = 0;
-                            s.anchor_left = false;
+                            s.anchor_left = true;
                         }
                     }
                     save_state_settings();
@@ -3682,6 +3878,12 @@ unsafe extern "system" fn wnd_proc(
                                 }
                                 _ => {}
                             }
+                            s.focused_provider = normalize_focused_provider(
+                                s.show_claude_code,
+                                s.show_codex,
+                                s.show_cursor,
+                                s.focused_provider,
+                            );
                             s.session_text = "...".to_string();
                             s.weekly_text = "...".to_string();
                             s.codex_session_text = "...".to_string();
@@ -4431,29 +4633,37 @@ fn paint(hdc: HDC, hwnd: HWND) {
     ) = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) => (
-                s.is_dark,
-                s.appearance,
-                s.language,
-                s.language.strings(),
-                s.session_percent,
-                s.session_text.clone(),
-                s.weekly_percent,
-                s.weekly_text.clone(),
-                s.codex_session_percent,
-                s.codex_session_text.clone(),
-                s.codex_weekly_percent,
-                s.codex_weekly_text.clone(),
-                s.cursor_session_percent,
-                s.cursor_session_text.clone(),
-                s.cursor_weekly_percent,
-                s.cursor_weekly_text.clone(),
-                s.show_claude_code,
-                s.show_codex,
-                s.show_cursor,
-                s.show_session_window,
-                s.show_weekly_window,
-            ),
+            Some(s) => {
+                let (show_claude_code, show_codex, show_cursor) = visible_provider_flags(
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_cursor,
+                    s.focused_provider,
+                );
+                (
+                    s.is_dark,
+                    s.appearance,
+                    s.language,
+                    s.language.strings(),
+                    s.session_percent,
+                    s.session_text.clone(),
+                    s.weekly_percent,
+                    s.weekly_text.clone(),
+                    s.codex_session_percent,
+                    s.codex_session_text.clone(),
+                    s.codex_weekly_percent,
+                    s.codex_weekly_text.clone(),
+                    s.cursor_session_percent,
+                    s.cursor_session_text.clone(),
+                    s.cursor_weekly_percent,
+                    s.cursor_weekly_text.clone(),
+                    show_claude_code,
+                    show_codex,
+                    show_cursor,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                )
+            }
             None => return,
         }
     };
@@ -4986,6 +5196,13 @@ mod tests {
     }
 
     #[test]
+    fn widget_is_vertically_centered_in_the_taskbar() {
+        assert_eq!(compute_anchor_y(100, 48, 32), 108);
+        assert_eq!(compute_anchor_y(0, 40, 40), 0);
+        assert_eq!(compute_anchor_y(10, 20, 30), 10);
+    }
+
+    #[test]
     fn left_anchor_setting_round_trips_without_changing_manual_position() {
         let mut settings = SettingsFile {
             tray_offset: 321,
@@ -4997,7 +5214,8 @@ mod tests {
         assert!(settings.anchor_left);
         assert_eq!(settings.tray_offset, 321);
         let legacy: SettingsFile = serde_json::from_str("{}").unwrap();
-        assert!(!legacy.anchor_left);
+        assert!(legacy.anchor_left);
+        assert!(SettingsFile::default().anchor_left);
     }
 
     #[test]

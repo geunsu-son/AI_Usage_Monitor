@@ -1,5 +1,6 @@
 mod codex;
 mod cursor;
+mod cursor_safe_storage;
 
 pub use codex::{fetch_codex, CodexError};
 pub use cursor::{fetch_cursor, CursorError};

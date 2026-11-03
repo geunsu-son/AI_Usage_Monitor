@@ -54,17 +54,19 @@ fn read_access_token() -> Result<String, CursorError> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .map_err(|_| CursorError::Unavailable)?;
-    let token: String = conn
+    let stored: String = conn
         .query_row(
             "SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken'",
             [],
             |row| row.get(0),
         )
         .map_err(|_| CursorError::LoginRequired)?;
-    if token.trim().is_empty() {
+    if stored.trim().is_empty() {
         return Err(CursorError::LoginRequired);
     }
-    Ok(token)
+    // Cursor 3.27+ may encrypt tokens at rest (`cursor-safe-storage:v1:`).
+    // Sending the ciphertext as a Bearer token yields HTTP 401 / "login again".
+    super::cursor_safe_storage::resolve_access_token(&stored).map_err(|_| CursorError::LoginRequired)
 }
 
 fn post_usage(token: &str) -> Result<serde_json::Value, CursorError> {

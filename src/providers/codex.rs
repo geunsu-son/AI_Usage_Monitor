@@ -124,27 +124,42 @@ impl CodexError {
     }
 }
 
-fn known_codex_install_paths() -> Vec<std::path::PathBuf> {
-    let mut paths = Vec::new();
+fn known_codex_bin_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        paths.push(
-            std::path::PathBuf::from(&local)
+        dirs.push(
+            std::path::PathBuf::from(local)
                 .join("OpenAI")
                 .join("Codex")
-                .join("bin")
-                .join("codex.exe"),
+                .join("bin"),
         );
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        dirs.push(
+            std::path::PathBuf::from(pf)
+                .join("OpenAI")
+                .join("Codex")
+                .join("bin"),
+        );
+    }
+    dirs
+}
+
+fn known_codex_install_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for bin in known_codex_bin_dirs() {
+        paths.push(bin.join("codex.exe"));
     }
     if let Ok(roaming) = std::env::var("APPDATA") {
         paths.push(
-            std::path::PathBuf::from(&roaming)
+            std::path::PathBuf::from(roaming)
                 .join("npm")
                 .join("codex.cmd"),
         );
     }
     if let Ok(pf) = std::env::var("ProgramFiles") {
         paths.push(
-            std::path::PathBuf::from(&pf)
+            std::path::PathBuf::from(pf)
                 .join("OpenAI")
                 .join("Codex")
                 .join("codex.exe"),
@@ -153,21 +168,51 @@ fn known_codex_install_paths() -> Vec<std::path::PathBuf> {
     paths
 }
 
+fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn push_codex_candidate(
+    candidates: &mut Vec<(std::path::PathBuf, Option<std::time::SystemTime>)>,
+    path: std::path::PathBuf,
+) {
+    if path.is_file() {
+        let mtime = file_mtime(&path);
+        candidates.push((path, mtime));
+    }
+}
+
+/// Codex desktop installs may place `codex.exe` directly under `bin\` or in a
+/// content-addressed subdirectory such as `bin\<hash>\codex.exe`.
+fn scan_codex_bin_dir(
+    bin_dir: &std::path::Path,
+    candidates: &mut Vec<(std::path::PathBuf, Option<std::time::SystemTime>)>,
+) {
+    push_codex_candidate(candidates, bin_dir.join("codex.exe"));
+    let Ok(entries) = std::fs::read_dir(bin_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            push_codex_candidate(candidates, path.join("codex.exe"));
+        }
+    }
+}
+
 fn locate_codex_cli() -> Result<std::path::PathBuf, CodexError> {
     use std::path::PathBuf;
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<(PathBuf, Option<std::time::SystemTime>)> = Vec::new();
     for path in known_codex_install_paths() {
-        if path.is_file() {
-            candidates.push(path);
-        }
+        push_codex_candidate(&mut candidates, path);
+    }
+    for bin in known_codex_bin_dirs() {
+        scan_codex_bin_dir(&bin, &mut candidates);
     }
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
             for name in ["codex.exe", "codex.cmd", "codex.ps1"] {
-                let p = dir.join(name);
-                if p.is_file() {
-                    candidates.push(p);
-                }
+                push_codex_candidate(&mut candidates, dir.join(name));
             }
         }
     }
@@ -184,20 +229,22 @@ fn locate_codex_cli() -> Result<std::path::PathBuf, CodexError> {
                 for line in String::from_utf8_lossy(&output.stdout).lines() {
                     let line = line.trim();
                     if !line.is_empty() {
-                        candidates.push(PathBuf::from(line));
+                        push_codex_candidate(&mut candidates, PathBuf::from(line));
                     }
                 }
             }
         }
     }
-    candidates.sort_by_key(|p| p.to_string_lossy().to_ascii_lowercase());
+    candidates.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.to_string_lossy().to_ascii_lowercase().cmp(&b.0.to_string_lossy().to_ascii_lowercase()))
+    });
     let mut deduped = Vec::new();
-    let mut last = String::new();
-    for p in candidates {
-        let key = p.to_string_lossy().to_ascii_lowercase();
-        if key != last {
-            deduped.push(p);
-            last = key;
+    let mut seen = std::collections::HashSet::new();
+    for (path, _) in candidates {
+        let key = path.to_string_lossy().to_ascii_lowercase();
+        if seen.insert(key) {
+            deduped.push(path);
         }
     }
     deduped.into_iter().next().ok_or(CodexError::CliMissing)
@@ -212,19 +259,24 @@ mod locate_tests {
         let Some(local) = std::env::var("LOCALAPPDATA").ok().map(std::path::PathBuf::from) else {
             return;
         };
-        let expected = local
-            .join("OpenAI")
-            .join("Codex")
-            .join("bin")
-            .join("codex.exe");
-        if !expected.is_file() {
+        let bin = local.join("OpenAI").join("Codex").join("bin");
+        let flat = bin.join("codex.exe");
+        let nested = std::fs::read_dir(&bin).ok().and_then(|entries| {
+            entries.flatten().find_map(|entry| {
+                let path = entry.path().join("codex.exe");
+                path.is_file().then_some(path)
+            })
+        });
+        if !flat.is_file() && nested.is_none() {
             return;
         }
         let resolved = locate_codex_cli().expect("codex should resolve when installed");
-        assert_eq!(
-            resolved.canonicalize().unwrap_or(resolved.clone()),
-            expected.canonicalize().unwrap_or(expected)
+        assert!(
+            resolved.ends_with("codex.exe") || resolved.ends_with("codex.cmd") || resolved.ends_with("codex.ps1"),
+            "unexpected codex path: {}",
+            resolved.display()
         );
+        assert!(resolved.is_file(), "resolved path missing: {}", resolved.display());
     }
 }
 
