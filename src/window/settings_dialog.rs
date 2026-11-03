@@ -9,9 +9,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, BST_CHECKED, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, NMHDR, TCIF_TEXT,
-    TCITEMW, TCM_GETCURSEL, TCM_GETITEMCOUNT, TCM_INSERTITEMW, TCM_SETCURSEL, TCM_SETITEMW,
-    TCN_SELCHANGE, WC_TABCONTROL,
+    InitCommonControlsEx, BST_CHECKED, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, ICC_WIN95_CLASSES,
+    INITCOMMONCONTROLSEX, NMHDR, TCIF_TEXT, TCITEMW, TCM_GETCURSEL, TCM_GETITEMCOUNT,
+    TCM_INSERTITEMW, TCM_SETCURSEL, TCM_SETITEMW, TCN_SELCHANGE, WC_TABCONTROL,
 };
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
@@ -188,7 +188,7 @@ fn ensure_common_controls() {
     INIT.call_once(|| {
         let controls = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_TAB_CLASSES,
+            dwICC: ICC_TAB_CLASSES | ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES,
         };
         let _ = unsafe { InitCommonControlsEx(&controls) };
     });
@@ -408,7 +408,7 @@ fn create_children(parent: HWND, state: &mut DialogState, instance: HINSTANCE) {
             }
         };
         let create_h = if field.kind() == ControlKind::Choice {
-            COMBO_DROP_HEIGHT
+            px(state.dpi, COMBO_DROP_HEIGHT)
         } else {
             10
         };
@@ -598,18 +598,12 @@ fn layout(hwnd: HWND, state: &mut DialogState, view: &SettingsView) {
     let mut y = pad + tab_h + pad;
 
     // Hide every field first, then show the active tab (+ Close).
+    // Do not resize while hiding: shrinking a combo to 0x0 (or to the closed
+    // edit height) permanently collapses its drop-down list.
     for field in Field::ALL {
         let index = field.index();
-        place_z(
-            state.controls[index],
-            HWND_TOP,
-            0,
-            0,
-            0,
-            0,
-            false,
-        );
-        place_z(state.labels[index], HWND_TOP, 0, 0, 0, 0, false);
+        hide_control(state.controls[index]);
+        hide_control(state.labels[index]);
     }
 
     if state.active_tab == Tab::Models {
@@ -728,7 +722,9 @@ fn layout_field_row(
             y + px(dpi, 26)
         }
         ControlKind::Choice => {
-            let row_h = px(dpi, 24);
+            // Closed edit looks ~24px tall, but the HWND height must include the
+            // drop-down list (CreateWindow height for CBS_DROPDOWNLIST).
+            let drop_h = px(dpi, COMBO_DROP_HEIGHT);
             if field.side_label(view).is_some() {
                 let label_w = px(dpi, 150);
                 place_z(
@@ -746,13 +742,14 @@ fn layout_field_row(
                     left + label_w,
                     y,
                     width - label_w,
-                    row_h,
+                    drop_h,
                     true,
                 );
             } else {
-                place_z(label, HWND_TOP, 0, 0, 0, 0, false);
-                place_z(control, HWND_TOP, left, y, width, row_h, true);
+                hide_control(label);
+                place_z(control, HWND_TOP, left, y, width, drop_h, true);
             }
+            set_combo_min_visible(control);
             y + px(dpi, 30)
         }
         ControlKind::Button => {
@@ -838,6 +835,15 @@ fn center_on_widget(widget: HWND, width: i32, height: i32) -> (i32, i32) {
 
 fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32, show: bool) {
     place_z(hwnd, HWND::default(), x, y, width, height, show);
+}
+
+fn hide_control(hwnd: HWND) {
+    if hwnd.is_invalid() {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
 }
 
 fn place_z(hwnd: HWND, insert_after: HWND, x: i32, y: i32, width: i32, height: i32, show: bool) {

@@ -11,7 +11,9 @@ fn main() {
         .set("FileVersion", version)
         .set("ProductVersion", version)
         .set_version_info(VersionInfo::FILEVERSION, numeric_version)
-        .set_version_info(VersionInfo::PRODUCTVERSION, numeric_version);
+        .set_version_info(VersionInfo::PRODUCTVERSION, numeric_version)
+        // ComCtl32 v6 is required for CB_SETMINVISIBLE and styled combo lists.
+        .set_manifest(include_str!("app.manifest"));
 
     res.compile().expect("Failed to compile Windows resources");
 }
