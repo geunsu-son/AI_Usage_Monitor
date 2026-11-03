@@ -7,8 +7,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::native_interop::Color;
 
+/// Nominal mark size. Columns size the icon from the visible bars instead.
+#[allow(dead_code)]
 pub const SIZE: i32 = 16;
-pub const RIGHT_MARGIN: i32 = 5;
+/// Gap between the provider mark and the usage bar. Matches the space after
+/// the left drag divider (`DIVIDER_RIGHT_MARGIN` in the widget layout).
+pub const RIGHT_MARGIN: i32 = 8;
 
 #[derive(Clone, Copy)]
 pub enum Provider {

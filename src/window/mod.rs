@@ -1,4 +1,5 @@
 mod settings;
+mod settings_dialog;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -84,8 +85,11 @@ struct AppState {
     show_cursor: bool,
     /// Which enabled provider the slim widget currently shows (left-click cycles).
     focused_provider: FocusedProvider,
-    show_session_window: bool,
-    show_weekly_window: bool,
+    show_codex_session: bool,
+    show_codex_weekly: bool,
+    show_cursor_auto: bool,
+    show_cursor_api: bool,
+    show_precise_reset: bool,
     alert_threshold_percent: u8,
     notified_quota_windows: BTreeSet<String>,
 
@@ -323,9 +327,9 @@ enum Palette {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BarStyle {
-    Continuous,
     #[default]
     Segmented,
+    Continuous,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,9 +437,15 @@ struct SettingsFile {
     #[serde(default)]
     focused_provider: FocusedProvider,
     #[serde(default = "default_show_usage_window")]
-    show_session_window: bool,
+    show_codex_session: bool,
     #[serde(default = "default_show_usage_window")]
-    show_weekly_window: bool,
+    show_codex_weekly: bool,
+    #[serde(default = "default_show_usage_window")]
+    show_cursor_auto: bool,
+    #[serde(default = "default_show_usage_window")]
+    show_cursor_api: bool,
+    #[serde(default = "default_show_precise_reset")]
+    show_precise_reset: bool,
     #[serde(default)]
     alert_threshold_percent: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -459,8 +469,11 @@ impl Default for SettingsFile {
             show_codex: true,
             show_cursor: true,
             focused_provider: FocusedProvider::default(),
-            show_session_window: true,
-            show_weekly_window: true,
+            show_codex_session: true,
+            show_codex_weekly: true,
+            show_cursor_auto: true,
+            show_cursor_api: true,
+            show_precise_reset: true,
             alert_threshold_percent: 0,
             notified_quota_windows: Vec::new(),
         }
@@ -472,7 +485,7 @@ fn default_adaptive_refresh() -> bool {
 }
 
 fn default_poll_interval() -> u32 {
-    POLL_15_MIN
+    POLL_5_MIN
 }
 
 fn default_widget_visible() -> bool {
@@ -492,6 +505,10 @@ fn default_show_cursor() -> bool {
 }
 
 fn default_show_usage_window() -> bool {
+    true
+}
+
+fn default_show_precise_reset() -> bool {
     true
 }
 
@@ -542,15 +559,55 @@ fn load_settings_from_paths(
     legacy_path: &std::path::Path,
 ) -> Option<(SettingsFile, bool)> {
     if let Ok(content) = std::fs::read_to_string(current_path) {
-        return serde_json::from_str(&content)
+        return settings_from_json(&content)
             .ok()
             .map(|settings| (settings, false));
     }
 
     let content = std::fs::read_to_string(legacy_path).ok()?;
-    serde_json::from_str(&content)
+    settings_from_json(&content)
         .ok()
         .map(|settings| (settings, true))
+}
+
+fn settings_from_json(content: &str) -> Result<SettingsFile, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(content)?;
+    migrate_legacy_usage_rows(&mut value);
+    serde_json::from_value(value)
+}
+
+/// Old files stored one session flag and one weekly flag for every provider.
+/// Those two values become the four provider rows. Files that already have a
+/// new row key keep that key and drop the legacy names.
+fn migrate_legacy_usage_rows(value: &mut serde_json::Value) {
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    let session = map
+        .get("show_session_window")
+        .and_then(serde_json::Value::as_bool);
+    let weekly = map
+        .get("show_weekly_window")
+        .and_then(serde_json::Value::as_bool);
+    fill_missing_row(map, "show_codex_session", session);
+    fill_missing_row(map, "show_cursor_auto", session);
+    fill_missing_row(map, "show_codex_weekly", weekly);
+    fill_missing_row(map, "show_cursor_api", weekly);
+    map.remove("show_session_window");
+    map.remove("show_weekly_window");
+}
+
+fn fill_missing_row(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    legacy: Option<bool>,
+) {
+    if map.contains_key(key) {
+        return;
+    }
+    if let Some(value) = legacy {
+        map.insert(key.to_string(), serde_json::Value::Bool(value));
+    }
 }
 
 fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
@@ -558,9 +615,16 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
     if !settings.show_claude_code && !settings.show_codex && !settings.show_cursor {
         settings.show_codex = true;
     }
-    if !settings.show_session_window && !settings.show_weekly_window {
-        settings.show_session_window = true;
-    }
+    settings::keep_primary_row_when_enabled(
+        settings.show_codex,
+        &mut settings.show_codex_session,
+        settings.show_codex_weekly,
+    );
+    settings::keep_primary_row_when_enabled(
+        settings.show_cursor,
+        &mut settings.show_cursor_auto,
+        settings.show_cursor_api,
+    );
     settings.alert_threshold_percent =
         settings::AlertThreshold::from_stored(settings.alert_threshold_percent).percent();
     settings.notified_quota_windows.sort();
@@ -594,8 +658,11 @@ fn save_state_settings() {
             show_codex: s.show_codex,
             show_cursor: s.show_cursor,
             focused_provider: s.focused_provider,
-            show_session_window: s.show_session_window,
-            show_weekly_window: s.show_weekly_window,
+            show_codex_session: s.show_codex_session,
+            show_codex_weekly: s.show_codex_weekly,
+            show_cursor_auto: s.show_cursor_auto,
+            show_cursor_api: s.show_cursor_api,
+            show_precise_reset: s.show_precise_reset,
             alert_threshold_percent: s.alert_threshold_percent,
             notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
         })
@@ -676,6 +743,8 @@ fn collect_low_quota_alerts(state: &mut AppState, data: &AppUsageData) -> Vec<Qu
                 strings.codex_model,
                 usage,
                 strings,
+                state.show_codex_session,
+                state.show_codex_weekly,
                 strings.session_window,
                 strings.weekly_window,
             );
@@ -693,6 +762,8 @@ fn collect_low_quota_alerts(state: &mut AppState, data: &AppUsageData) -> Vec<Qu
                 strings.cursor_model,
                 usage,
                 strings,
+                state.show_cursor_auto,
+                state.show_cursor_api,
                 strings.cursor_auto_model,
                 strings.cursor_api_model,
             );
@@ -712,33 +783,39 @@ fn append_provider_alerts(
     provider_label: &str,
     usage: &crate::models::UsageData,
     _strings: Strings,
+    show_session: bool,
+    show_weekly: bool,
     session_label: &'static str,
     weekly_label: &'static str,
 ) {
-    append_quota_alert(
-        alerts,
-        notified,
-        threshold,
-        language,
-        kind,
-        provider_key,
-        provider_label,
-        "session",
-        session_label,
-        &usage.session,
-    );
-    append_quota_alert(
-        alerts,
-        notified,
-        threshold,
-        language,
-        kind,
-        provider_key,
-        provider_label,
-        "weekly",
-        weekly_label,
-        &usage.weekly,
-    );
+    if show_session {
+        append_quota_alert(
+            alerts,
+            notified,
+            threshold,
+            language,
+            kind,
+            provider_key,
+            provider_label,
+            "session",
+            session_label,
+            &usage.session,
+        );
+    }
+    if show_weekly {
+        append_quota_alert(
+            alerts,
+            notified,
+            threshold,
+            language,
+            kind,
+            provider_key,
+            provider_label,
+            "weekly",
+            weekly_label,
+            &usage.weekly,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -804,8 +881,8 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
                     strings.claude_code_model,
                     &s.session_text,
                     &s.weekly_text,
-                    s.show_session_window,
-                    s.show_weekly_window,
+                    s.show_codex_session,
+                    s.show_codex_weekly,
                     strings.session_window,
                     strings.weekly_window,
                 ));
@@ -815,8 +892,8 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
                     strings.codex_model,
                     &s.codex_session_text,
                     &s.codex_weekly_text,
-                    s.show_session_window,
-                    s.show_weekly_window,
+                    s.show_codex_session,
+                    s.show_codex_weekly,
                     strings.session_window,
                     strings.weekly_window,
                 ));
@@ -826,8 +903,8 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
                     strings.cursor_model,
                     &s.cursor_session_text,
                     &s.cursor_weekly_text,
-                    s.show_session_window,
-                    s.show_weekly_window,
+                    s.show_cursor_auto,
+                    s.show_cursor_api,
                     strings.cursor_auto_model,
                     strings.cursor_api_model,
                 ));
@@ -978,17 +1055,24 @@ fn sync_usage_text_compact(taskbar_hwnd: HWND, taskbar_rect: RECT) -> bool {
         return false;
     };
     let want_compact = {
-        let (_claude, show_codex, show_cursor) = visible_provider_flags(
+        let (show_claude, show_codex, show_cursor) = visible_provider_flags(
             s.show_claude_code,
             s.show_codex,
             s.show_cursor,
             s.focused_provider,
         );
         let full = total_widget_width_for(
-            active_model_count(show_codex, show_cursor),
+            show_claude,
+            show_codex,
+            show_cursor,
+            s.show_codex_session,
+            s.show_codex_weekly,
+            s.show_cursor_auto,
+            s.show_cursor_api,
             s.language,
             s.appearance,
             false,
+            (taskbar_rect.bottom - taskbar_rect.top).max(1),
         );
         full > available
     };
@@ -1073,6 +1157,7 @@ fn refresh_usage_texts(state: &mut AppState) {
         return;
     };
 
+    let precise = state.show_precise_reset && !state.usage_text_compact;
     if let Some(codex) = data.codex.as_ref() {
         if state.usage_text_compact {
             state.codex_session_text = poller::format_remaining_only(&codex.session);
@@ -1083,12 +1168,14 @@ fn refresh_usage_texts(state: &mut AppState) {
                 strings,
                 false,
                 poller::UsageWindowKind::Session,
+                precise,
             );
             state.codex_weekly_text = poller::format_codex_line(
                 &codex.weekly,
                 strings,
                 false,
                 poller::UsageWindowKind::Weekly,
+                precise,
             );
         }
     } else if state.show_codex {
@@ -1105,10 +1192,14 @@ fn refresh_usage_texts(state: &mut AppState) {
             state.cursor_session_text = poller::format_remaining_only(&cursor.session);
             state.cursor_weekly_text = poller::format_remaining_only(&cursor.weekly);
         } else {
-            state.cursor_session_text =
-                poller::format_line(&cursor.session, strings, poller::UsageWindowKind::Session);
-            state.cursor_weekly_text =
-                poller::format_line(&cursor.weekly, strings, poller::UsageWindowKind::Weekly);
+            // Auto and API share one Cursor reset; show the clock only on auto.
+            state.cursor_session_text = poller::format_line(
+                &cursor.session,
+                strings,
+                poller::UsageWindowKind::Session,
+                precise,
+            );
+            state.cursor_weekly_text = poller::format_remaining_only(&cursor.weekly);
         }
     } else if state.show_cursor {
         let label = state.monitor.services[1]
@@ -1567,7 +1658,8 @@ fn set_startup_enabled(enable: bool) {
 }
 
 // Taskbar widget metrics (rectangular segmented bars, compact type)
-const SEGMENT_W: i32 = 9;
+/// Slimmer than a square cell so the fill reads as a short rectangle.
+const SEGMENT_W: i32 = 6;
 const SEGMENT_H: i32 = 13;
 const ROW_HEIGHT: i32 = 18;
 const SEGMENT_GAP: i32 = 2;
@@ -1575,8 +1667,6 @@ const SEGMENT_COUNT: i32 = 10;
 
 const LEFT_DIVIDER_W: i32 = 3;
 const DIVIDER_RIGHT_MARGIN: i32 = 8;
-const LABEL_WIDTH: i32 = 20;
-const LABEL_RIGHT_MARGIN: i32 = 8;
 const BAR_RIGHT_MARGIN: i32 = 6;
 const TEXT_WIDTH: i32 = 110;
 const MODEL_RIGHT_MARGIN: i32 = 3;
@@ -1607,10 +1697,6 @@ fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
         let _ = GetClientRect(hwnd, &mut client);
         is_drag_handle_point(pt.x, pt.y, client.bottom - client.top)
     }
-}
-
-fn active_model_count(show_codex: bool, show_cursor: bool) -> i32 {
-    (show_codex as i32 + show_cursor as i32).max(1)
 }
 
 fn enabled_focus_targets(
@@ -1679,16 +1765,48 @@ fn cycle_focused_provider(
     Some(targets[(index + 1) % targets.len()])
 }
 
-fn quota_row_labels(
-    strings: Strings,
-    show_codex: bool,
-    show_cursor: bool,
-) -> (&'static str, &'static str) {
-    if show_cursor && !show_codex {
-        (strings.cursor_auto_model, strings.cursor_api_model)
+fn layout_row_gap(height: i32) -> i32 {
+    if height < sc(WIDGET_HEIGHT) {
+        sc(2)
     } else {
-        (strings.session_window, strings.weekly_window)
+        sc(8)
     }
+}
+
+fn client_height(hwnd: HWND) -> i32 {
+    unsafe {
+        let mut rect = RECT::default();
+        if GetClientRect(hwnd, &mut rect).is_ok() {
+            let height = rect.bottom - rect.top;
+            if height > 0 {
+                return height;
+            }
+        }
+    }
+    sc(WIDGET_HEIGHT)
+}
+
+/// Two rows span the top of the upper bar through the bottom of the lower bar.
+/// One row matches the bar, and a slim bar stays at least `min_one_row` tall.
+fn provider_icon_size(
+    row_height: i32,
+    row_gap: i32,
+    bar_height: i32,
+    two_rows: bool,
+    min_one_row: i32,
+) -> i32 {
+    if two_rows {
+        row_height + row_gap + bar_height
+    } else {
+        bar_height.max(min_one_row)
+    }
+}
+
+fn column_icon_size(appearance: Appearance, row_gap: i32, upper: bool, lower: bool) -> i32 {
+    let bar = appearance.bar_height();
+    let full = provider_icon_size(appearance.row_height(), row_gap, bar, upper && lower, bar);
+    // Slightly under the bar stack so the mark does not dominate the fill.
+    ((full * 90) / 100).max(1)
 }
 
 fn row_bar_segment_count(active_models: i32) -> i32 {
@@ -1699,10 +1817,10 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
     }
 }
 
-/// Labels and reset texts that can occupy the widest space in each column.
+/// Kind labels and reset texts that can occupy the widest space after the percentage.
 fn usage_layout_samples(language: LanguageId) -> (Vec<&'static str>, Vec<String>) {
     let strings = language.strings();
-    let labels = vec![
+    let kinds = vec![
         strings.session_window,
         strings.weekly_window,
         strings.cursor_auto_model,
@@ -1716,9 +1834,15 @@ fn usage_layout_samples(language: LanguageId) -> (Vec<&'static str>, Vec<String>
     ]
     .into_iter()
     .map(|suffix| format!("99{suffix} *"))
-    .chain(std::iter::once(format!("{} *", strings.now)))
+    .chain([
+        format!("{} *", strings.now),
+        format!("99{} 23{} *", strings.day_suffix, strings.hour_suffix),
+        "23:59 *".to_string(),
+        "12/31 23:59 *".to_string(),
+        "2026-12-31 23:59 *".to_string(),
+    ])
     .collect();
-    (labels, resets)
+    (kinds, resets)
 }
 
 fn preferred_font_faces(language: LanguageId) -> &'static [&'static str] {
@@ -1809,20 +1933,17 @@ unsafe fn create_widget_font(appearance: Appearance, language: LanguageId) -> HF
     )
 }
 
-/// Label and quota-text column widths in physical pixels, measured with the
-/// fonts used for drawing so larger text and longer translations still fit.
-fn usage_layout_widths(language: LanguageId, appearance: Appearance, compact: bool) -> (i32, i32) {
-    let reset_x = sc(quota_text::reset_offset(appearance.font_px()));
-    let fallback = (sc(LABEL_WIDTH), sc(TEXT_WIDTH));
+/// Quota-text width in physical pixels, measured with the fonts used for
+/// drawing so the kind label and the reset string both fit after the percentage.
+fn usage_layout_widths(language: LanguageId, appearance: Appearance, compact: bool) -> i32 {
+    let percent_only = sc(quota_text::percent_column_width(appearance.font_px())) + sc(3);
+    if compact {
+        return percent_only;
+    }
+    let fallback = sc(TEXT_WIDTH);
     unsafe {
         let hdc = GetDC(HWND::default());
         if hdc.is_invalid() {
-            if compact {
-                return (
-                    fallback.0,
-                    sc(quota_text::percent_column_width(appearance.font_px())) + sc(3),
-                );
-            }
             return fallback;
         }
         let measure = |font: HFONT, values: &mut dyn Iterator<Item = &str>| {
@@ -1843,29 +1964,26 @@ fn usage_layout_widths(language: LanguageId, appearance: Appearance, compact: bo
             let _ = DeleteObject(font);
             widest
         };
-        let (labels, resets) = usage_layout_samples(language);
+        let (kinds, resets) = usage_layout_samples(language);
         let face = resolve_font_face(language);
-        let label_font = create_widget_font(appearance, language);
+        let kind_font = create_widget_font(appearance, language);
         let reset_font = quota_text::create_reset_font(sc(appearance.font_px()), face);
-        let widths = if label_font.is_invalid() || reset_font.is_invalid() {
-            let _ = DeleteObject(label_font);
+        let width = if kind_font.is_invalid() || reset_font.is_invalid() {
+            let _ = DeleteObject(kind_font);
             let _ = DeleteObject(reset_font);
             fallback
         } else {
-            (
-                measure(label_font, &mut labels.into_iter()) + sc(2),
-                (reset_x + measure(reset_font, &mut resets.iter().map(String::as_str)) + sc(3))
-                    .max(fallback.1),
-            )
+            let kind_width = measure(kind_font, &mut kinds.into_iter());
+            let reset_width = measure(reset_font, &mut resets.iter().map(String::as_str));
+            (sc(quota_text::reset_offset(appearance.font_px()))
+                + kind_width
+                + sc(quota_text::COLUMN_GAP)
+                + reset_width
+                + sc(3))
+            .max(fallback)
         };
         ReleaseDC(HWND::default(), hdc);
-        if compact {
-            return (
-                widths.0,
-                sc(quota_text::percent_column_width(appearance.font_px())) + sc(3),
-            );
-        }
-        widths
+        width
     }
 }
 
@@ -1874,61 +1992,92 @@ fn usage_percent_for_display(_language: LanguageId, used_percentage: f64) -> f64
 }
 
 fn total_widget_width_for(
-    active_models: i32,
+    show_claude: bool,
+    show_codex: bool,
+    show_cursor: bool,
+    codex_session: bool,
+    codex_weekly: bool,
+    cursor_auto: bool,
+    cursor_api: bool,
     language: LanguageId,
     appearance: Appearance,
     compact: bool,
+    height: i32,
 ) -> i32 {
-    let bar_segments = row_bar_segment_count(active_models);
-    let (label_width, text_width) = usage_layout_widths(language, appearance, compact);
-    let model_width = model_usage_width(bar_segments, text_width);
-
-    sc(LEFT_DIVIDER_W)
-        + sc(DIVIDER_RIGHT_MARGIN)
-        + label_width
-        + sc(LABEL_RIGHT_MARGIN)
-        + model_width * active_models
-        + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
-        + sc(RIGHT_MARGIN)
+    let text_width = usage_layout_widths(language, appearance, compact);
+    let row_gap = layout_row_gap(height);
+    let shown = [show_claude, show_codex, show_cursor]
+        .into_iter()
+        .filter(|shown| *shown)
+        .count() as i32;
+    let segments = row_bar_segment_count(shown.max(1));
+    let mut columns = Vec::new();
+    if show_claude {
+        columns.push((codex_session, codex_weekly));
+    }
+    if show_codex {
+        columns.push((codex_session, codex_weekly));
+    }
+    if show_cursor {
+        columns.push((cursor_auto, cursor_api));
+    }
+    if columns.is_empty() {
+        columns.push((true, false));
+    }
+    let mut width = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+    for (index, (upper, lower)) in columns.iter().enumerate() {
+        if index > 0 {
+            width += sc(MODEL_RIGHT_MARGIN);
+        }
+        width += model_usage_width(
+            segments,
+            text_width,
+            column_icon_size(appearance, row_gap, *upper, *lower),
+        );
+    }
+    width + sc(RIGHT_MARGIN)
 }
 
-fn total_widget_width_for_state(state: &AppState) -> i32 {
-    let (_claude, show_codex, show_cursor) = visible_provider_flags(
+fn total_widget_width_for_state(state: &AppState, height: i32) -> i32 {
+    let (show_claude, show_codex, show_cursor) = visible_provider_flags(
         state.show_claude_code,
         state.show_codex,
         state.show_cursor,
         state.focused_provider,
     );
     total_widget_width_for(
-        active_model_count(show_codex, show_cursor),
+        show_claude,
+        show_codex,
+        show_cursor,
+        state.show_codex_session,
+        state.show_codex_weekly,
+        state.show_cursor_auto,
+        state.show_cursor_api,
         state.language,
         state.appearance,
         state.usage_text_compact,
+        height,
     )
 }
 
 fn total_widget_width() -> i32 {
-    let (active_models, language, appearance, compact) = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| {
-                let (_claude, show_codex, show_cursor) = visible_provider_flags(
-                    s.show_claude_code,
-                    s.show_codex,
-                    s.show_cursor,
-                    s.focused_provider,
-                );
-                (
-                    active_model_count(show_codex, show_cursor),
-                    s.language,
-                    s.appearance,
-                    s.usage_text_compact,
-                )
-            })
-            .unwrap_or((1, LanguageId::English, Appearance::default(), false))
-    };
-    total_widget_width_for(active_models, language, appearance, compact)
+    let state = lock_state();
+    match state.as_ref() {
+        Some(state) => total_widget_width_for_state(state, client_height(state.hwnd.to_hwnd())),
+        None => total_widget_width_for(
+            false,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            LanguageId::English,
+            Appearance::default(),
+            false,
+            sc(WIDGET_HEIGHT),
+        ),
+    }
 }
 
 fn claude_accent_color() -> Color {
@@ -2068,7 +2217,18 @@ pub fn run() {
 
         // Create as layered popup (will be reparented into taskbar)
         let title = native_interop::wide_str(language.strings().window_title);
-        let initial_model_count = active_model_count(settings.show_codex, settings.show_cursor);
+        let focused = normalize_focused_provider(
+            settings.show_claude_code,
+            settings.show_codex,
+            settings.show_cursor,
+            settings.focused_provider,
+        );
+        let (show_claude, show_codex, show_cursor) = visible_provider_flags(
+            settings.show_claude_code,
+            settings.show_codex,
+            settings.show_cursor,
+            focused,
+        );
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             PCWSTR::from_raw(class_name.as_ptr()),
@@ -2076,7 +2236,19 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count, language, settings.appearance, false),
+            total_widget_width_for(
+                show_claude,
+                show_codex,
+                show_cursor,
+                settings.show_codex_session,
+                settings.show_codex_weekly,
+                settings.show_cursor_auto,
+                settings.show_cursor_api,
+                language,
+                settings.appearance,
+                false,
+                sc(WIDGET_HEIGHT),
+            ),
             sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -2142,8 +2314,11 @@ pub fn run() {
                     settings.show_cursor,
                     settings.focused_provider,
                 ),
-                show_session_window: settings.show_session_window,
-                show_weekly_window: settings.show_weekly_window,
+                show_codex_session: settings.show_codex_session,
+                show_codex_weekly: settings.show_codex_weekly,
+                show_cursor_auto: settings.show_cursor_auto,
+                show_cursor_api: settings.show_cursor_api,
+                show_precise_reset: settings.show_precise_reset,
                 alert_threshold_percent: settings.alert_threshold_percent,
                 notified_quota_windows: settings.notified_quota_windows.into_iter().collect(),
                 data: None,
@@ -2218,7 +2393,7 @@ pub fn run() {
             state
                 .as_ref()
                 .map(|s| s.poll_interval_ms)
-                .unwrap_or(POLL_15_MIN)
+                .unwrap_or(POLL_5_MIN)
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
         SetTimer(hwnd, TIMER_FRESHNESS, 30_000, None);
@@ -2252,6 +2427,9 @@ pub fn run() {
         // Message loop
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+            if settings_dialog::pre_translate(&msg) {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -2266,32 +2444,44 @@ fn update_quota_tooltips() {
         let mut regions = Vec::new();
         if !s.dragging {
             let localized = s.language == LanguageId::Korean;
-            let count = active_model_count(s.show_codex, s.show_cursor);
-            let (label_width, text_width) =
-                usage_layout_widths(s.language, s.appearance, s.usage_text_compact);
-            let width = model_usage_width(row_bar_segment_count(count), text_width);
-            let mut left = sc(LEFT_DIVIDER_W)
-                + sc(DIVIDER_RIGHT_MARGIN)
-                + label_width
-                + sc(LABEL_RIGHT_MARGIN);
-            for (service_id, visible, name, session, weekly) in [
+            let (show_claude, show_codex, show_cursor) = visible_provider_flags(
+                s.show_claude_code,
+                s.show_codex,
+                s.show_cursor,
+                s.focused_provider,
+            );
+            let text_width = usage_layout_widths(s.language, s.appearance, s.usage_text_compact);
+            let row_gap = layout_row_gap(client_height(s.hwnd.to_hwnd()));
+            let shown = [show_claude, show_codex, show_cursor]
+                .into_iter()
+                .filter(|shown| *shown)
+                .count() as i32;
+            let segments = row_bar_segment_count(shown.max(1));
+            let mut left = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+            for (service_id, visible, upper, lower, name, session, weekly) in [
                 (
                     None,
-                    s.show_claude_code,
+                    show_claude,
+                    true,
+                    true,
                     "Claude Code",
                     &s.session_text,
                     &s.weekly_text,
                 ),
                 (
                     Some(0),
-                    s.show_codex,
+                    show_codex,
+                    s.show_codex_session,
+                    s.show_codex_weekly,
                     "Codex",
                     &s.codex_session_text,
                     &s.codex_weekly_text,
                 ),
                 (
                     Some(1),
-                    s.show_cursor,
+                    show_cursor,
+                    s.show_cursor_auto,
+                    s.show_cursor_api,
                     "Cursor",
                     &s.cursor_session_text,
                     &s.cursor_weekly_text,
@@ -2327,10 +2517,11 @@ fn update_quota_tooltips() {
                 if name == "Codex" {
                     if let Some(id) = service_id {
                         if s.monitor.services[id].data.is_some() {
-                            for (missing, is_weekly) in
-                                [(session == "--", false), (weekly == "--", true)]
-                            {
-                                if missing {
+                            for (missing, shown, is_weekly) in [
+                                (session == "--", upper, false),
+                                (weekly == "--", lower, true),
+                            ] {
+                                if missing && shown {
                                     text.push('\n');
                                     text.push_str(quota_tooltip::message(localized, is_weekly));
                                 }
@@ -2338,6 +2529,11 @@ fn update_quota_tooltips() {
                         }
                     }
                 }
+                let width = model_usage_width(
+                    segments,
+                    text_width,
+                    column_icon_size(s.appearance, row_gap, upper, lower),
+                );
                 regions.push((
                     RECT {
                         left,
@@ -2381,8 +2577,11 @@ fn render_layered() {
         show_claude_code,
         show_codex,
         show_cursor,
-        show_session_window,
-        show_weekly_window,
+        show_codex_session,
+        show_codex_weekly,
+        show_cursor_auto,
+        show_cursor_api,
+        usage_text_compact,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -2415,8 +2614,11 @@ fn render_layered() {
                     show_claude_code,
                     show_codex,
                     show_cursor,
-                    s.show_session_window,
-                    s.show_weekly_window,
+                    s.show_codex_session,
+                    s.show_codex_weekly,
+                    s.show_cursor_auto,
+                    s.show_cursor_api,
+                    s.usage_text_compact,
                 )
             }
             None => return,
@@ -2508,8 +2710,11 @@ fn render_layered() {
             show_claude_code,
             show_codex,
             show_cursor,
-            show_session_window,
-            show_weekly_window,
+            show_codex_session,
+            show_codex_weekly,
+            show_cursor_auto,
+            show_cursor_api,
+            usage_text_compact,
             &codex_accent,
             &cursor_accent,
         );
@@ -2595,8 +2800,11 @@ fn paint_content(
     show_claude_code: bool,
     show_codex: bool,
     show_cursor: bool,
-    show_session_window: bool,
-    show_weekly_window: bool,
+    show_codex_session: bool,
+    show_codex_weekly: bool,
+    show_cursor_auto: bool,
+    show_cursor_api: bool,
+    usage_text_compact: bool,
     codex_accent: &Color,
     cursor_accent: &Color,
 ) {
@@ -2608,14 +2816,7 @@ fn paint_content(
         let codex_weekly_pct = usage_percent_for_display(language, codex_weekly_pct);
         let cursor_session_pct = usage_percent_for_display(language, cursor_session_pct);
         let cursor_weekly_pct = usage_percent_for_display(language, cursor_weekly_pct);
-        let (label_width, text_width) = usage_layout_widths(
-            language,
-            appearance,
-            lock_state()
-                .as_ref()
-                .map(|s| s.usage_text_compact)
-                .unwrap_or(false),
-        );
+        let text_width = usage_layout_widths(language, appearance, usage_text_compact);
 
         let client_rect = RECT {
             left: 0,
@@ -2666,14 +2867,7 @@ fn paint_content(
         let _ = DeleteObject(right_brush);
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let row_gap = if height < sc(WIDGET_HEIGHT) {
-            sc(2)
-        } else {
-            sc(8)
-        };
-        let row1_y = (height - 2 * appearance.row_height() - row_gap).max(0) / 2;
-        let row2_y = row1_y + appearance.row_height() + row_gap;
-        let single_row_y = (height - appearance.row_height()) / 2;
+        let row_gap = layout_row_gap(height);
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -2681,88 +2875,97 @@ fn paint_content(
         let font = create_widget_font(appearance, language);
         let old_font = SelectObject(hdc, font);
 
-        // One provider mark per column, centered across the visible quota rows.
-        let icon_size = sc(provider_icons::SIZE);
-        let icon_y = (height - icon_size) / 2;
-        let active_models = active_model_count(show_codex, show_cursor);
-        let model_width = model_usage_width(row_bar_segment_count(active_models), text_width)
-            + sc(MODEL_RIGHT_MARGIN);
-        let mut icon_x = content_x + label_width + sc(LABEL_RIGHT_MARGIN);
-        if show_claude_code {
-            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Claude);
-            icon_x += model_width;
-        }
-        if show_codex {
-            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Codex);
-            icon_x += model_width;
-        }
-        if show_cursor {
-            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Cursor);
-        }
-
-        let (row1_label, row2_label) = quota_row_labels(strings, show_codex, show_cursor);
+        let active_models = [show_claude_code, show_codex, show_cursor]
+            .into_iter()
+            .filter(|shown| *shown)
+            .count() as i32;
+        let segment_count = row_bar_segment_count(active_models.max(1));
+        let use_model_text_colors = active_models > 1 && appearance.palette == Palette::System;
+        let claude_value = if use_model_text_colors {
+            claude_usage_text_color(is_dark)
+        } else {
+            *text_color
+        };
+        let codex_value = *codex_accent;
+        let cursor_value = if use_model_text_colors {
+            cursor_usage_text_color(is_dark)
+        } else {
+            *text_color
+        };
         let font_face = resolve_font_face(language);
-
-        if show_session_window {
-            draw_row(
+        let mut column_x = content_x;
+        let mut paint_column = |rows: &[RowPaint], accent: &Color, value: &Color, provider: Provider| {
+            if rows.is_empty() {
+                return;
+            }
+            let column_width = draw_provider_column(
                 hdc,
-                content_x,
-                if show_weekly_window {
-                    row1_y
-                } else {
-                    single_row_y
-                },
+                column_x,
+                height,
+                row_gap,
                 is_dark,
                 appearance,
-                text_color,
-                row1_label,
-                session_pct,
-                session_text,
-                codex_session_pct,
-                codex_session_text,
-                cursor_session_pct,
-                cursor_session_text,
-                show_claude_code,
-                show_codex,
-                show_cursor,
+                rows,
                 accent,
-                codex_accent,
-                cursor_accent,
+                value,
                 track,
-                label_width,
                 text_width,
+                segment_count,
                 font_face,
+                provider,
+            );
+            column_x += column_width + sc(MODEL_RIGHT_MARGIN);
+        };
+        if show_claude_code {
+            // Claude has the same 5-hour and weekly rows as Codex.
+            paint_column(
+                &provider_rows(
+                    true,
+                    true,
+                    session_pct,
+                    session_text,
+                    strings.session_window,
+                    weekly_pct,
+                    weekly_text,
+                    strings.weekly_window,
+                ),
+                accent,
+                &claude_value,
+                Provider::Claude,
             );
         }
-        if show_weekly_window {
-            draw_row(
-                hdc,
-                content_x,
-                if show_session_window {
-                    row2_y
-                } else {
-                    single_row_y
-                },
-                is_dark,
-                appearance,
-                text_color,
-                row2_label,
-                weekly_pct,
-                weekly_text,
-                codex_weekly_pct,
-                codex_weekly_text,
-                cursor_weekly_pct,
-                cursor_weekly_text,
-                show_claude_code,
-                show_codex,
-                show_cursor,
-                accent,
+        if show_codex {
+            paint_column(
+                &provider_rows(
+                    show_codex_session,
+                    show_codex_weekly,
+                    codex_session_pct,
+                    codex_session_text,
+                    strings.session_window,
+                    codex_weekly_pct,
+                    codex_weekly_text,
+                    strings.weekly_window,
+                ),
                 codex_accent,
+                &codex_value,
+                Provider::Codex,
+            );
+        }
+        if show_cursor {
+            paint_column(
+                &provider_rows(
+                    show_cursor_auto,
+                    show_cursor_api,
+                    cursor_session_pct,
+                    cursor_session_text,
+                    strings.cursor_auto_model,
+                    cursor_weekly_pct,
+                    cursor_weekly_text,
+                    strings.cursor_api_model,
+                ),
                 cursor_accent,
-                track,
-                label_width,
-                text_width,
-                font_face,
+                &cursor_value,
+                Provider::Cursor,
             );
         }
 
@@ -2950,19 +3153,30 @@ fn schedule_countdown_timer() {
     let Some(data) = s.data.as_ref() else {
         return;
     };
+    let precise = s.show_precise_reset && !s.usage_text_compact;
     let delays = [
-        data.codex
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.codex
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
-        data.cursor
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.cursor
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+        data.codex.as_ref().and_then(|usage| {
+            poller::time_until_display_change(
+                usage.session.resets_at,
+                poller::UsageWindowKind::Session,
+                precise,
+            )
+        }),
+        data.codex.as_ref().and_then(|usage| {
+            poller::time_until_display_change(
+                usage.weekly.resets_at,
+                poller::UsageWindowKind::Weekly,
+                precise,
+            )
+        }),
+        data.cursor.as_ref().and_then(|usage| {
+            poller::time_until_display_change(
+                usage.session.resets_at,
+                poller::UsageWindowKind::Session,
+                precise,
+            )
+        }),
+        // Cursor API omits the reset clock (same instant as auto).
     ];
     let min_delay = delays.into_iter().flatten().min();
 
@@ -3080,7 +3294,13 @@ fn position_at_taskbar() {
     let reserve_left = taskbar_widget_reserve_left(taskbar_hwnd, taskbar_rect);
     let anchor_top = taskbar_rect.top;
     let anchor_height = taskbar_height;
-    let widget_width = total_widget_width();
+    let widget_width = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(state) => total_widget_width_for_state(state, taskbar_height.max(1)),
+            None => total_widget_width(),
+        }
+    };
     let max_offset = (reserve_left - taskbar_rect.left - widget_width).max(0);
     let tray_offset = tray_offset.clamp(0, max_offset);
     let offset_changed = {
@@ -3132,6 +3352,7 @@ fn position_at_taskbar() {
         ));
     }
     if compact_changed {
+        schedule_countdown_timer();
         render_layered();
     }
 }
@@ -3411,7 +3632,10 @@ unsafe extern "system" fn wnd_proc(
                     if let Some(taskbar_hwnd) = s.taskbar_hwnd {
                         if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
                             let reserve = taskbar_widget_reserve_left(taskbar_hwnd, taskbar_rect);
-                            let width = total_widget_width_for_state(s);
+                            let width = total_widget_width_for_state(
+                                s,
+                                (taskbar_rect.bottom - taskbar_rect.top).max(1),
+                            );
                             s.tray_offset = tray_offset_from_screen_left(
                                 taskbar_rect.left,
                                 reserve,
@@ -3463,7 +3687,10 @@ unsafe extern "system" fn wnd_proc(
                         if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
                             let reserve_left =
                                 taskbar_widget_reserve_left(taskbar_hwnd, taskbar_rect);
-                            let widget_width = total_widget_width_for_state(s);
+                            let widget_width = total_widget_width_for_state(
+                                s,
+                                (taskbar_rect.bottom - taskbar_rect.top).max(1),
+                            );
                             let max_offset =
                                 (reserve_left - taskbar_rect.left - widget_width).max(0);
                             if new_offset > max_offset {
@@ -3616,7 +3843,7 @@ unsafe extern "system" fn wnd_proc(
 #[derive(Clone)]
 enum MenuChoice {
     Setting(settings::SettingsCommand),
-    Refresh,
+    OpenSettings,
     VersionAction,
     Exit,
 }
@@ -3715,20 +3942,6 @@ impl MenuBuilder {
     }
 }
 
-fn refresh_now(hwnd: HWND) {
-    {
-        let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            s.session_text = "...".to_string();
-            s.weekly_text = "...".to_string();
-            s.codex_session_text = "...".to_string();
-            s.codex_weekly_text = "...".to_string();
-        }
-    }
-    render_layered();
-    request_poll(SendHwnd::from_hwnd(hwnd), true);
-}
-
 fn exit_app() {
     let hook = {
         let state = lock_state();
@@ -3788,7 +4001,7 @@ fn show_context_menu(hwnd: HWND) {
     build_context_menu(&mut menu, &view, install_channel, &update_status);
     match menu.track(hwnd) {
         Some(MenuChoice::Setting(command)) => settings::apply(hwnd, command),
-        Some(MenuChoice::Refresh) => refresh_now(hwnd),
+        Some(MenuChoice::OpenSettings) => settings_dialog::open(hwnd),
         Some(MenuChoice::VersionAction) => run_version_action(hwnd),
         Some(MenuChoice::Exit) => exit_app(),
         None => {}
@@ -3801,248 +4014,44 @@ fn build_context_menu(
     install_channel: InstallChannel,
     update_status: &UpdateStatus,
 ) {
-    use settings::{AlertThreshold, PollInterval, QuotaWindow, SettingsCommand};
+    use settings::SettingsCommand;
 
     let strings = view.strings();
     let language = view.language;
 
-    menu.item(strings.refresh, false, true, MenuChoice::Refresh);
-
-    menu.submenu(strings.update_frequency, |menu| {
-        for interval in PollInterval::ALL {
+    menu.item("Open Settings", false, true, MenuChoice::OpenSettings);
+    menu.submenu(strings.language, |menu| {
+        menu.item(
+            strings.system_default,
+            view.language_override.is_none(),
+            true,
+            MenuChoice::Setting(SettingsCommand::SetLanguage(None)),
+        );
+        for lang in LanguageId::ALL {
             menu.item(
-                interval.label(strings),
-                view.poll_interval == interval,
+                lang.native_name(),
+                view.language_override == Some(lang),
                 true,
-                MenuChoice::Setting(SettingsCommand::SetPollInterval(interval)),
-            );
-        }
-        menu.separator();
-        menu.item(
-            tr(
-                language,
-                "남은 할당량 ≤20%일 때 1분마다 새로고침",
-                "Refresh every minute when remaining ≤20%",
-            ),
-            view.adaptive_refresh,
-            true,
-            MenuChoice::Setting(SettingsCommand::SetAdaptiveRefresh(!view.adaptive_refresh)),
-        );
-    });
-
-    menu.submenu(strings.models, |menu| {
-        let claude = view.provider(FocusedProvider::ClaudeCode);
-        let claude_label = claude_code_menu_label(strings, language, view.claude_available());
-        menu.item(
-            &claude_label,
-            claude.checked,
-            claude.enabled,
-            MenuChoice::Setting(SettingsCommand::SetProviderShown(
-                FocusedProvider::ClaudeCode,
-                !claude.checked,
-            )),
-        );
-        let codex = view.provider(FocusedProvider::Codex);
-        menu.item(
-            strings.codex_model,
-            codex.checked,
-            codex.enabled,
-            MenuChoice::Setting(SettingsCommand::SetProviderShown(
-                FocusedProvider::Codex,
-                !codex.checked,
-            )),
-        );
-        let cursor = view.provider(FocusedProvider::Cursor);
-        menu.item(
-            strings.cursor_model,
-            cursor.checked,
-            cursor.enabled,
-            MenuChoice::Setting(SettingsCommand::SetProviderShown(
-                FocusedProvider::Cursor,
-                !cursor.checked,
-            )),
-        );
-    });
-
-    menu.submenu(tr(language, "사용량 표시", "Usage display"), |menu| {
-        let session = view.quota_window(QuotaWindow::Session);
-        menu.item(
-            tr(language, "5시간 할당량", "5-hour quota"),
-            session.checked,
-            session.enabled,
-            MenuChoice::Setting(SettingsCommand::SetQuotaWindowShown(
-                QuotaWindow::Session,
-                !session.checked,
-            )),
-        );
-        let weekly = view.quota_window(QuotaWindow::Weekly);
-        menu.item(
-            tr(language, "주간 할당량", "Weekly quota"),
-            weekly.checked,
-            weekly.enabled,
-            MenuChoice::Setting(SettingsCommand::SetQuotaWindowShown(
-                QuotaWindow::Weekly,
-                !weekly.checked,
-            )),
-        );
-    });
-
-    menu.submenu(tr(language, "모양", "Appearance"), |menu| {
-        menu.item(
-            tr(
-                language,
-                "권장: 반투명 어두운 작업 표시줄",
-                "Recommended: translucent dark taskbar",
-            ),
-            view.appearance == Appearance::translucent_dark_taskbar(),
-            true,
-            MenuChoice::Setting(SettingsCommand::SetAppearance(
-                Appearance::translucent_dark_taskbar(),
-            )),
-        );
-        menu.item(
-            tr(language, "기본 모양으로 재설정", "Reset appearance"),
-            view.appearance == Appearance::default(),
-            true,
-            MenuChoice::Setting(SettingsCommand::SetAppearance(Appearance::default())),
-        );
-        menu.separator();
-        menu.submenu(
-            tr(language, "텍스트 및 색", "Text and colors"),
-            |menu| {
-                for palette in Palette::ALL {
-                    let mut appearance = view.appearance;
-                    appearance.palette = palette;
-                    menu.item(
-                        palette.label(language),
-                        view.appearance.palette == palette,
-                        true,
-                        MenuChoice::Setting(SettingsCommand::SetAppearance(appearance)),
-                    );
-                }
-            },
-        );
-        menu.submenu(tr(language, "막대 스타일", "Bar style"), |menu| {
-            for style in BarStyle::ALL {
-                let mut appearance = view.appearance;
-                appearance.bar_style = style;
-                menu.item(
-                    style.label(language),
-                    view.appearance.bar_style == style,
-                    true,
-                    MenuChoice::Setting(SettingsCommand::SetAppearance(appearance)),
-                );
-            }
-        });
-        menu.submenu(tr(language, "막대 두께", "Bar thickness"), |menu| {
-            for thickness in BarThickness::ALL {
-                let mut appearance = view.appearance;
-                appearance.bar_thickness = thickness;
-                menu.item(
-                    thickness.label(language),
-                    view.appearance.bar_thickness == thickness,
-                    true,
-                    MenuChoice::Setting(SettingsCommand::SetAppearance(appearance)),
-                );
-            }
-        });
-        menu.submenu(tr(language, "글자 크기", "Text size"), |menu| {
-            for font_size in FontSize::ALL {
-                let mut appearance = view.appearance;
-                appearance.font_size = font_size;
-                menu.item(
-                    font_size.label(language),
-                    view.appearance.font_size == font_size,
-                    true,
-                    MenuChoice::Setting(SettingsCommand::SetAppearance(appearance)),
-                );
-            }
-        });
-    });
-
-    menu.submenu(tr(language, "할당량 알림", "Quota alerts"), |menu| {
-        for threshold in AlertThreshold::ALL {
-            menu.item(
-                threshold.label(language),
-                view.alert_threshold == threshold,
-                true,
-                MenuChoice::Setting(SettingsCommand::SetAlertThreshold(threshold)),
+                MenuChoice::Setting(SettingsCommand::SetLanguage(Some(lang))),
             );
         }
     });
-
-    menu.submenu(strings.settings, |menu| {
-        menu.item(
-            strings.start_with_windows,
-            view.start_with_windows,
-            true,
-            MenuChoice::Setting(SettingsCommand::SetStartWithWindows(
-                !view.start_with_windows,
-            )),
-        );
-        menu.item(
-            tr(
-                language,
-                "작업 표시줄 왼쪽에 고정",
-                "Pin to the left edge of the taskbar",
-            ),
-            view.anchor_left,
-            true,
-            MenuChoice::Setting(SettingsCommand::SetAnchorLeft(!view.anchor_left)),
-        );
-        menu.item(
-            strings.reset_position,
-            false,
-            true,
-            MenuChoice::Setting(SettingsCommand::ResetPosition),
-        );
-        if view.displays.len() > 1 {
-            menu.submenu(tr(language, "디스플레이", "Display"), |menu| {
-                for (index, (choice, label)) in view.displays.iter().enumerate() {
-                    menu.item(
-                        label,
-                        view.current_display == Some(index),
-                        true,
-                        MenuChoice::Setting(SettingsCommand::SetDisplay(choice.clone())),
-                    );
-                }
-            });
-        }
-        menu.submenu(strings.language, |menu| {
-            menu.item(
-                strings.system_default,
-                view.language_override.is_none(),
-                true,
-                MenuChoice::Setting(SettingsCommand::SetLanguage(None)),
-            );
-            for lang in LanguageId::ALL {
-                menu.item(
-                    lang.native_name(),
-                    view.language_override == Some(lang),
-                    true,
-                    MenuChoice::Setting(SettingsCommand::SetLanguage(Some(lang))),
-                );
-            }
-        });
-        menu.separator();
-        let version_label = version_action_label(strings, language, install_channel, update_status);
-        let version_enabled = !matches!(
-            update_status,
-            UpdateStatus::Checking | UpdateStatus::Applying
-        );
-        menu.item(
-            &version_label,
-            false,
-            version_enabled,
-            MenuChoice::VersionAction,
-        );
-    });
-
     menu.item(
         strings.show_widget,
         view.widget_visible,
         true,
         MenuChoice::Setting(SettingsCommand::SetWidgetVisible(!view.widget_visible)),
+    );
+    let version_label = version_action_label(strings, language, install_channel, update_status);
+    let version_enabled = !matches!(
+        update_status,
+        UpdateStatus::Checking | UpdateStatus::Applying
+    );
+    menu.item(
+        &version_label,
+        false,
+        version_enabled,
+        MenuChoice::VersionAction,
     );
     menu.separator();
     menu.item(strings.exit, false, true, MenuChoice::Exit);
@@ -4070,8 +4079,11 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_claude_code,
         show_codex,
         show_cursor,
-        show_session_window,
-        show_weekly_window,
+        show_codex_session,
+        show_codex_weekly,
+        show_cursor_auto,
+        show_cursor_api,
+        usage_text_compact,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -4102,8 +4114,11 @@ fn paint(hdc: HDC, hwnd: HWND) {
                     show_claude_code,
                     show_codex,
                     show_cursor,
-                    s.show_session_window,
-                    s.show_weekly_window,
+                    s.show_codex_session,
+                    s.show_codex_weekly,
+                    s.show_cursor_auto,
+                    s.show_cursor_api,
+                    s.usage_text_compact,
                 )
             }
             None => return,
@@ -4156,8 +4171,11 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_claude_code,
             show_codex,
             show_cursor,
-            show_session_window,
-            show_weekly_window,
+            show_codex_session,
+            show_codex_weekly,
+            show_cursor_auto,
+            show_cursor_api,
+            usage_text_compact,
             &codex_accent,
             &cursor_accent,
         );
@@ -4170,122 +4188,98 @@ fn paint(hdc: HDC, hwnd: HWND) {
     }
 }
 
-fn draw_row(
-    hdc: HDC,
-    x: i32,
-    y: i32,
-    is_dark: bool,
-    appearance: Appearance,
-    text_color: &Color,
-    label: &str,
-    claude_percent: f64,
-    claude_text: &str,
-    codex_percent: f64,
-    codex_text: &str,
-    cursor_percent: f64,
-    cursor_text: &str,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_cursor: bool,
-    claude_accent: &Color,
-    codex_accent: &Color,
-    cursor_accent: &Color,
-    track: &Color,
-    label_width: i32,
-    text_width: i32,
-    font_face: &str,
-) {
-    let active_models = active_model_count(show_codex, show_cursor);
-    let segment_count = row_bar_segment_count(active_models);
-    let use_model_text_colors = active_models > 1 && appearance.palette == Palette::System;
-    let is_dark = appearance.is_dark(is_dark);
-    let claude_value_color = if use_model_text_colors {
-        claude_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let codex_value_color = provider_icons::codex_color(is_dark);
-    let cursor_value_color = if use_model_text_colors {
-        cursor_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-
-    unsafe {
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
-        let mut label_rect = RECT {
-            left: x,
-            top: y,
-            right: x + label_width,
-            bottom: y + appearance.row_height(),
-        };
-        let _ = DrawTextW(
-            hdc,
-            &mut label_wide,
-            &mut label_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
-
-        let mut model_x = x + label_width + sc(LABEL_RIGHT_MARGIN);
-        if show_claude_code {
-            draw_usage_bar(
-                hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
-                y,
-                segment_count,
-                claude_percent,
-                claude_text,
-                claude_accent,
-                track,
-                &claude_value_color,
-                text_width,
-                is_dark,
-                appearance,
-                font_face,
-            );
-            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_codex {
-            draw_usage_bar(
-                hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
-                y,
-                segment_count,
-                codex_percent,
-                codex_text,
-                codex_accent,
-                track,
-                &codex_value_color,
-                text_width,
-                is_dark,
-                appearance,
-                font_face,
-            );
-            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_cursor {
-            draw_usage_bar(
-                hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
-                y,
-                segment_count,
-                cursor_percent,
-                cursor_text,
-                cursor_accent,
-                track,
-                &cursor_value_color,
-                text_width,
-                is_dark,
-                appearance,
-                font_face,
-            );
-        }
-    }
+struct RowPaint<'a> {
+    percent: f64,
+    text: &'a str,
+    kind: &'a str,
 }
 
-fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
-    sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN)
+fn provider_rows<'a>(
+    show_upper: bool,
+    show_lower: bool,
+    upper_percent: f64,
+    upper_text: &'a str,
+    upper_kind: &'a str,
+    lower_percent: f64,
+    lower_text: &'a str,
+    lower_kind: &'a str,
+) -> Vec<RowPaint<'a>> {
+    let mut rows = Vec::new();
+    if show_upper {
+        rows.push(RowPaint {
+            percent: upper_percent,
+            text: upper_text,
+            kind: upper_kind,
+        });
+    }
+    if show_lower {
+        rows.push(RowPaint {
+            percent: lower_percent,
+            text: lower_text,
+            kind: lower_kind,
+        });
+    }
+    rows
+}
+
+fn draw_provider_column(
+    hdc: HDC,
+    x: i32,
+    height: i32,
+    row_gap: i32,
+    is_dark: bool,
+    appearance: Appearance,
+    rows: &[RowPaint],
+    accent: &Color,
+    value_color: &Color,
+    track: &Color,
+    text_width: i32,
+    segment_count: i32,
+    font_face: &str,
+    provider: Provider,
+) -> i32 {
+    let two = rows.len() >= 2;
+    let row_h = appearance.row_height();
+    let row1_y = if two {
+        (height - 2 * row_h - row_gap).max(0) / 2
+    } else {
+        (height - row_h) / 2
+    };
+    let row2_y = row1_y + row_h + row_gap;
+    let icon_size = column_icon_size(appearance, row_gap, !rows.is_empty(), two);
+    let bar_h = appearance.bar_height();
+    let upper_bar_top = row1_y + (row_h - bar_h) / 2;
+    let icon_y = if two {
+        upper_bar_top
+    } else {
+        upper_bar_top - (icon_size - bar_h).max(0) / 2
+    };
+    provider_icons::draw(hdc, x, icon_y, icon_size, provider);
+    let bar_x = x + icon_size + sc(provider_icons::RIGHT_MARGIN);
+    for (index, row) in rows.iter().take(2).enumerate() {
+        draw_usage_bar(
+            hdc,
+            bar_x,
+            if index == 0 { row1_y } else { row2_y },
+            segment_count,
+            row.percent,
+            row.text,
+            Some(row.kind),
+            accent,
+            track,
+            value_color,
+            text_width,
+            is_dark,
+            appearance,
+            font_face,
+        );
+    }
+    model_usage_width(segment_count, text_width, icon_size)
+}
+
+fn model_usage_width(segment_count: i32, text_width: i32, icon_size: i32) -> i32 {
+    icon_size
+        + sc(provider_icons::RIGHT_MARGIN)
         + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count
         - sc(SEGMENT_GAP)
         + sc(BAR_RIGHT_MARGIN)
@@ -4307,6 +4301,7 @@ fn draw_usage_bar(
     segment_count: i32,
     percent: f64,
     text: &str,
+    kind: Option<&str>,
     accent: &Color,
     track: &Color,
     text_color: &Color,
@@ -4355,6 +4350,7 @@ fn draw_usage_bar(
         appearance.row_height(),
         text_width,
         text,
+        kind,
         text_color,
         &reset_text_color(appearance, is_dark),
         appearance.font_px(),
@@ -4463,26 +4459,33 @@ mod tests {
                         font_size,
                         ..Appearance::default()
                     };
-                    let (label_width, text_width) =
-                        usage_layout_widths(language, appearance, false);
-                    let reset_width =
-                        text_width - sc(quota_text::reset_offset(appearance.font_px()));
+                    let text_width = usage_layout_widths(language, appearance, false);
                     let face = resolve_font_face(language);
-                    let label_font = create_widget_font(appearance, language);
+                    let kind_font = create_widget_font(appearance, language);
                     let reset_font = quota_text::create_reset_font(sc(appearance.font_px()), face);
-                    assert!(!label_font.is_invalid() && !reset_font.is_invalid());
-                    let (labels, resets) = usage_layout_samples(language);
-                    for label in labels {
-                        let (width, height) = width_of(label_font, label);
-                        assert!(width <= label_width, "{language:?}: {label:?}");
-                        assert!(height <= appearance.row_height(), "{language:?}: {label:?}");
+                    assert!(!kind_font.is_invalid() && !reset_font.is_invalid());
+                    let (kinds, resets) = usage_layout_samples(language);
+                    let mut kind_width = 0;
+                    for kind in &kinds {
+                        let (width, height) = width_of(kind_font, kind);
+                        kind_width = kind_width.max(width);
+                        assert!(height <= appearance.row_height(), "{language:?}: {kind:?}");
                     }
+                    let mut reset_width = 0;
                     for reset in &resets {
                         let (width, height) = width_of(reset_font, reset);
-                        assert!(width <= reset_width, "{language:?}: {reset:?}");
+                        reset_width = reset_width.max(width);
                         assert!(height <= appearance.row_height(), "{language:?}: {reset:?}");
                     }
-                    let _ = DeleteObject(label_font);
+                    let used = sc(quota_text::reset_offset(appearance.font_px()))
+                        + kind_width
+                        + sc(quota_text::COLUMN_GAP)
+                        + reset_width;
+                    assert!(
+                        used <= text_width,
+                        "{language:?}: kind+reset {used} > {text_width}"
+                    );
+                    let _ = DeleteObject(kind_font);
                     let _ = DeleteObject(reset_font);
                 }
             }
@@ -4584,8 +4587,11 @@ mod tests {
         assert_eq!(settings.language.as_deref(), Some("zh-CN"));
         assert!(settings.show_codex);
         assert!(!settings.show_claude_code);
-        assert!(settings.show_session_window);
-        assert!(settings.show_weekly_window);
+        assert!(settings.show_codex_session);
+        assert!(settings.show_codex_weekly);
+        assert!(settings.show_cursor_auto);
+        assert!(settings.show_cursor_api);
+        assert!(settings.show_precise_reset);
         assert_eq!(settings.alert_threshold_percent, 0);
         let _ = std::fs::remove_dir_all(base);
     }
@@ -4700,17 +4706,32 @@ mod tests {
     #[test]
     fn normalizes_usage_display_and_alert_settings() {
         let settings = normalize_settings(SettingsFile {
-            show_session_window: false,
-            show_weekly_window: false,
+            show_codex_session: false,
+            show_codex_weekly: false,
+            show_cursor_auto: false,
+            show_cursor_api: false,
             alert_threshold_percent: 17,
             notified_quota_windows: vec!["codex:weekly:1".into(), "codex:weekly:1".into()],
             ..SettingsFile::default()
         });
 
-        assert!(settings.show_session_window);
-        assert!(!settings.show_weekly_window);
+        assert!(settings.show_codex_session);
+        assert!(!settings.show_codex_weekly);
+        assert!(settings.show_cursor_auto);
+        assert!(!settings.show_cursor_api);
         assert_eq!(settings.alert_threshold_percent, 0);
         assert_eq!(settings.notified_quota_windows.len(), 1);
+
+        let cursor_off = normalize_settings(SettingsFile {
+            show_cursor: false,
+            show_cursor_auto: false,
+            show_cursor_api: false,
+            ..SettingsFile::default()
+        });
+        assert!(!cursor_off.show_cursor);
+        assert!(!cursor_off.show_cursor_auto);
+        assert!(!cursor_off.show_cursor_api);
+        assert!(cursor_off.show_codex_session);
     }
 
     #[test]
@@ -4727,6 +4748,46 @@ mod tests {
         assert!(changed);
         assert!(!settings.show_claude_code);
         assert!(settings.show_codex);
+    }
+
+    #[test]
+    fn legacy_session_and_weekly_flags_fill_every_provider_row() {
+        let hidden_session = settings_from_json(
+            r#"{"show_session_window": false, "show_weekly_window": true}"#,
+        )
+        .unwrap();
+        assert!(!hidden_session.show_codex_session);
+        assert!(!hidden_session.show_cursor_auto);
+        assert!(hidden_session.show_codex_weekly);
+        assert!(hidden_session.show_cursor_api);
+        let saved = serde_json::to_string(&hidden_session).unwrap();
+        assert!(!saved.contains("show_session_window"));
+        assert!(!saved.contains("show_weekly_window"));
+
+        let both_hidden = normalize_settings(
+            settings_from_json(r#"{"show_session_window": false, "show_weekly_window": false}"#)
+                .unwrap(),
+        );
+        assert!(both_hidden.show_codex_session);
+        assert!(!both_hidden.show_codex_weekly);
+        assert!(both_hidden.show_cursor_auto);
+        assert!(!both_hidden.show_cursor_api);
+
+        let already_split = settings_from_json(
+            r#"{"show_codex_session": false, "show_session_window": true, "show_weekly_window": false}"#,
+        )
+        .unwrap();
+        assert!(!already_split.show_codex_session);
+        assert!(!already_split.show_codex_weekly);
+        assert!(already_split.show_cursor_auto);
+        assert!(!already_split.show_cursor_api);
+    }
+
+    #[test]
+    fn provider_icon_spans_two_bars_and_matches_one_bar() {
+        assert_eq!(provider_icon_size(18, 8, 13, true, 12), 18 + 8 + 13);
+        assert_eq!(provider_icon_size(18, 8, 13, false, 12), 13);
+        assert_eq!(provider_icon_size(18, 8, 8, false, 12), 12);
     }
 
     #[test]

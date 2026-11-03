@@ -23,7 +23,8 @@ pub(super) enum SettingsCommand {
     SetPollInterval(PollInterval),
     SetAdaptiveRefresh(bool),
     SetProviderShown(FocusedProvider, bool),
-    SetQuotaWindowShown(QuotaWindow, bool),
+    SetUsageRowShown(UsageRow, bool),
+    SetPreciseReset(bool),
     SetAlertThreshold(AlertThreshold),
     SetAppearance(Appearance),
     SetLanguage(Option<LanguageId>),
@@ -115,10 +116,40 @@ impl AlertThreshold {
     }
 }
 
+/// One quota row. Codex and Cursor rows are independent. A provider keeps at
+/// least one of its rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum QuotaWindow {
-    Session,
-    Weekly,
+pub(super) enum UsageRow {
+    CodexSession,
+    CodexWeekly,
+    CursorAuto,
+    CursorApi,
+}
+
+impl UsageRow {
+    pub(super) const ALL: [Self; 4] = [
+        Self::CodexSession,
+        Self::CodexWeekly,
+        Self::CursorAuto,
+        Self::CursorApi,
+    ];
+
+    pub(super) fn label(self, strings: Strings) -> String {
+        let (service, kind) = match self {
+            Self::CodexSession => (strings.codex_model, strings.session_window),
+            Self::CodexWeekly => (strings.codex_model, strings.weekly_window),
+            Self::CursorAuto => (strings.cursor_model, strings.cursor_auto_model),
+            Self::CursorApi => (strings.cursor_model, strings.cursor_api_model),
+        };
+        format!("{service} {kind}")
+    }
+}
+
+/// An enabled provider with both rows off shows its primary row again.
+pub(super) fn keep_primary_row_when_enabled(enabled: bool, primary: &mut bool, secondary: bool) {
+    if enabled && !*primary && !secondary {
+        *primary = true;
+    }
 }
 
 /// Taskbar identity. `device` is the monitor device name when Windows reports one.
@@ -146,12 +177,12 @@ impl Palette {
 }
 
 impl BarStyle {
-    pub(super) const ALL: [Self; 2] = [Self::Continuous, Self::Segmented];
+    pub(super) const ALL: [Self; 2] = [Self::Segmented, Self::Continuous];
 
     pub(super) fn label(self, language: LanguageId) -> &'static str {
         match self {
-            Self::Continuous => tr(language, "연속 둥근", "Continuous rounded"),
             Self::Segmented => tr(language, "분할", "Segmented"),
+            Self::Continuous => tr(language, "연속 둥근", "Continuous rounded"),
         }
     }
 }
@@ -190,8 +221,10 @@ struct Visibility {
     codex: bool,
     cursor: bool,
     claude_available: bool,
-    session: bool,
-    weekly: bool,
+    codex_session: bool,
+    codex_weekly: bool,
+    cursor_auto: bool,
+    cursor_api: bool,
 }
 
 impl Visibility {
@@ -201,8 +234,10 @@ impl Visibility {
             codex: state.show_codex,
             cursor: state.show_cursor,
             claude_available: state.claude_code_available,
-            session: state.show_session_window,
-            weekly: state.show_weekly_window,
+            codex_session: state.show_codex_session,
+            codex_weekly: state.show_codex_weekly,
+            cursor_auto: state.show_cursor_auto,
+            cursor_api: state.show_cursor_api,
         }
     }
 
@@ -227,20 +262,25 @@ impl Visibility {
         }
     }
 
-    fn window_shown(self, window: QuotaWindow) -> bool {
-        match window {
-            QuotaWindow::Session => self.session,
-            QuotaWindow::Weekly => self.weekly,
+    fn row_shown(self, row: UsageRow) -> bool {
+        match row {
+            UsageRow::CodexSession => self.codex_session,
+            UsageRow::CodexWeekly => self.codex_weekly,
+            UsageRow::CursorAuto => self.cursor_auto,
+            UsageRow::CursorApi => self.cursor_api,
         }
     }
 
-    fn can_set_window(self, window: QuotaWindow, shown: bool) -> bool {
+    /// An enabled provider keeps one row. A disabled provider can hide both.
+    fn can_set_row(self, row: UsageRow, shown: bool) -> bool {
         if shown {
             return true;
         }
-        match window {
-            QuotaWindow::Session => self.weekly,
-            QuotaWindow::Weekly => self.session,
+        match row {
+            UsageRow::CodexSession => !self.codex || self.codex_weekly,
+            UsageRow::CodexWeekly => !self.codex || self.codex_session,
+            UsageRow::CursorAuto => !self.cursor || self.cursor_api,
+            UsageRow::CursorApi => !self.cursor || self.cursor_auto,
         }
     }
 }
@@ -261,6 +301,7 @@ pub(super) struct SettingsView {
     pub anchor_left: bool,
     pub widget_visible: bool,
     pub start_with_windows: bool,
+    pub precise_reset: bool,
     pub displays: Vec<(DisplayChoice, String)>,
     pub current_display: Option<usize>,
     visibility: Visibility,
@@ -280,6 +321,7 @@ impl SettingsView {
                     s.appearance,
                     s.anchor_left,
                     s.widget_visible,
+                    s.show_precise_reset,
                     Visibility::of(s),
                     s.taskbar_hwnd,
                 )
@@ -294,6 +336,7 @@ impl SettingsView {
             appearance,
             anchor_left,
             widget_visible,
+            precise_reset,
             visibility,
             taskbar_hwnd,
         )) = copied
@@ -312,6 +355,7 @@ impl SettingsView {
             anchor_left,
             widget_visible,
             start_with_windows,
+            precise_reset,
             displays,
             current_display,
             visibility,
@@ -330,6 +374,7 @@ impl SettingsView {
             anchor_left: true,
             widget_visible: true,
             start_with_windows: is_startup_enabled(),
+            precise_reset: true,
             displays,
             current_display,
             visibility: Visibility {
@@ -337,8 +382,10 @@ impl SettingsView {
                 codex: true,
                 cursor: true,
                 claude_available: false,
-                session: true,
-                weekly: true,
+                codex_session: true,
+                codex_weekly: true,
+                cursor_auto: true,
+                cursor_api: true,
             },
         }
     }
@@ -359,13 +406,14 @@ impl SettingsView {
         }
     }
 
-    pub(super) fn quota_window(&self, window: QuotaWindow) -> Toggle {
-        let checked = self.visibility.window_shown(window);
+    pub(super) fn usage_row(&self, row: UsageRow) -> Toggle {
+        let checked = self.visibility.row_shown(row);
         Toggle {
             checked,
-            enabled: self.visibility.can_set_window(window, !checked),
+            enabled: self.visibility.can_set_row(row, !checked),
         }
     }
+
 }
 
 fn read_displays(
@@ -424,8 +472,11 @@ struct AppStateSnapshot {
     codex: bool,
     cursor: bool,
     focus: FocusedProvider,
-    session: bool,
-    weekly: bool,
+    codex_session: bool,
+    codex_weekly: bool,
+    cursor_auto: bool,
+    cursor_api: bool,
+    precise_reset: bool,
     alert: AlertThreshold,
     appearance: Appearance,
     language_override: Option<LanguageId>,
@@ -444,8 +495,11 @@ impl AppStateSnapshot {
             codex: state.show_codex,
             cursor: state.show_cursor,
             focus: state.focused_provider,
-            session: state.show_session_window,
-            weekly: state.show_weekly_window,
+            codex_session: state.show_codex_session,
+            codex_weekly: state.show_codex_weekly,
+            cursor_auto: state.show_cursor_auto,
+            cursor_api: state.show_cursor_api,
+            precise_reset: state.show_precise_reset,
             alert: AlertThreshold::from_stored(state.alert_threshold_percent),
             appearance: state.appearance,
             language_override: state.language_override,
@@ -481,6 +535,7 @@ struct Effects {
     notify: bool,
     force_poll: bool,
     clear_texts: bool,
+    refresh_texts: bool,
     balloons: Vec<QuotaAlert>,
 }
 
@@ -497,6 +552,7 @@ impl Effects {
             && !self.notify
             && !self.force_poll
             && !self.clear_texts
+            && !self.refresh_texts
             && self.balloons.is_empty()
     }
 }
@@ -515,6 +571,7 @@ impl Default for Effects {
             notify: false,
             force_poll: false,
             clear_texts: false,
+            refresh_texts: false,
             balloons: Vec::new(),
         }
     }
@@ -560,8 +617,10 @@ fn effects_for_command(
         codex: before.codex,
         cursor: before.cursor,
         claude_available: facts.claude_available,
-        session: before.session,
-        weekly: before.weekly,
+        codex_session: before.codex_session,
+        codex_weekly: before.codex_weekly,
+        cursor_auto: before.cursor_auto,
+        cursor_api: before.cursor_api,
     };
     let mut after = before.clone();
     let mut effects = Effects::default();
@@ -596,6 +655,8 @@ fn effects_for_command(
             }
             after.focus =
                 normalize_focused_provider(after.claude, after.codex, after.cursor, before.focus);
+            keep_primary_row_when_enabled(after.codex, &mut after.codex_session, after.codex_weekly);
+            keep_primary_row_when_enabled(after.cursor, &mut after.cursor_auto, after.cursor_api);
             effects.save = true;
             effects.clear_texts = true;
             effects.force_poll = true;
@@ -603,17 +664,29 @@ fn effects_for_command(
             effects.render = true;
             effects.sync_tray = true;
         }
-        SettingsCommand::SetQuotaWindowShown(window, shown) => {
-            if visibility.window_shown(*window) == *shown
-                || !visibility.can_set_window(*window, *shown)
-            {
+        SettingsCommand::SetUsageRowShown(row, shown) => {
+            if visibility.row_shown(*row) == *shown || !visibility.can_set_row(*row, *shown) {
                 return unchanged(before);
             }
-            match window {
-                QuotaWindow::Session => after.session = *shown,
-                QuotaWindow::Weekly => after.weekly = *shown,
+            match row {
+                UsageRow::CodexSession => after.codex_session = *shown,
+                UsageRow::CodexWeekly => after.codex_weekly = *shown,
+                UsageRow::CursorAuto => after.cursor_auto = *shown,
+                UsageRow::CursorApi => after.cursor_api = *shown,
             }
             effects.save = true;
+            effects.reposition = true;
+            effects.render = true;
+            effects.sync_tray = true;
+        }
+        SettingsCommand::SetPreciseReset(enabled) => {
+            if before.precise_reset == *enabled {
+                return unchanged(before);
+            }
+            after.precise_reset = *enabled;
+            effects.save = true;
+            effects.refresh_texts = true;
+            effects.reposition = true;
             effects.render = true;
             effects.sync_tray = true;
         }
@@ -720,8 +793,11 @@ fn commit_snapshot(state: &mut AppState, before: &AppStateSnapshot, after: &AppS
     state.show_codex = after.codex;
     state.show_cursor = after.cursor;
     state.focused_provider = after.focus;
-    state.show_session_window = after.session;
-    state.show_weekly_window = after.weekly;
+    state.show_codex_session = after.codex_session;
+    state.show_codex_weekly = after.codex_weekly;
+    state.show_cursor_auto = after.cursor_auto;
+    state.show_cursor_api = after.cursor_api;
+    state.show_precise_reset = after.precise_reset;
     state.alert_threshold_percent = after.alert.percent();
     state.appearance = after.appearance;
     state.anchor_left = after.anchor_left;
@@ -755,6 +831,9 @@ fn mutate(state: &mut AppState, change: Change) -> Effects {
     commit_snapshot(state, &before, &transition.after);
     if transition.effects.clear_texts {
         clear_usage_texts(state);
+    }
+    if transition.effects.refresh_texts {
+        super::refresh_usage_texts(state);
     }
     if transition.effects.clear_notified {
         state.notified_quota_windows.clear();
@@ -797,6 +876,9 @@ fn run_effects(widget: HWND, effects: Effects) {
             }
         }
     }
+    if effects.refresh_texts {
+        super::schedule_countdown_timer();
+    }
     if effects.reposition {
         position_at_taskbar();
     }
@@ -818,17 +900,18 @@ fn run_effects(widget: HWND, effects: Effects) {
 /// The state lock is dropped before `save_state_settings` and before any Win32
 /// call that can pump messages. `save_state_settings` takes the saves lock first.
 pub(super) fn apply(widget: HWND, command: SettingsCommand) {
-    let Some(change) = prepare(widget, command) else {
-        return;
-    };
-    let effects = {
-        let mut state = lock_state();
-        let Some(state) = state.as_mut() else {
-            return;
+    if let Some(change) = prepare(widget, command) {
+        let effects = {
+            let mut state = lock_state();
+            match state.as_mut() {
+                Some(state) => mutate(state, change),
+                None => Effects::default(),
+            }
         };
-        mutate(state, change)
-    };
-    run_effects(widget, effects);
+        run_effects(widget, effects);
+    }
+    // A rejected edit still resyncs so the open dialog snaps back to AppState.
+    super::settings_dialog::sync();
 }
 
 #[cfg(test)]
@@ -840,8 +923,11 @@ fn sample_snapshot() -> AppStateSnapshot {
         codex: true,
         cursor: true,
         focus: FocusedProvider::Codex,
-        session: true,
-        weekly: true,
+        codex_session: true,
+        codex_weekly: true,
+        cursor_auto: true,
+        cursor_api: true,
+        precise_reset: true,
         alert: AlertThreshold::Ten,
         appearance: Appearance::default(),
         language_override: None,
@@ -900,24 +986,79 @@ fn visibility_refuses_the_last_provider_and_unavailable_claude() {
         codex: true,
         cursor: false,
         claude_available: true,
-        session: true,
-        weekly: false,
+        codex_session: true,
+        codex_weekly: false,
+        cursor_auto: true,
+        cursor_api: true,
     };
     assert!(!only_codex.can_set_provider(FocusedProvider::Codex, false));
     assert!(only_codex.can_set_provider(FocusedProvider::Cursor, true));
-    assert!(!only_codex.can_set_window(QuotaWindow::Session, false));
-    assert!(only_codex.can_set_window(QuotaWindow::Weekly, true));
+    assert!(!only_codex.can_set_row(UsageRow::CodexSession, false));
+    assert!(only_codex.can_set_row(UsageRow::CodexWeekly, true));
+    assert!(only_codex.can_set_row(UsageRow::CursorAuto, false));
+    let cursor_last_row = Visibility {
+        cursor: true,
+        cursor_auto: true,
+        cursor_api: false,
+        ..only_codex
+    };
+    assert!(!cursor_last_row.can_set_row(UsageRow::CursorAuto, false));
 
     let claude_unavailable = Visibility {
         claude: false,
         codex: true,
         cursor: true,
         claude_available: false,
-        session: true,
-        weekly: true,
+        codex_session: true,
+        codex_weekly: true,
+        cursor_auto: true,
+        cursor_api: true,
     };
     assert!(!claude_unavailable.can_set_provider(FocusedProvider::ClaudeCode, true));
     assert!(claude_unavailable.can_set_provider(FocusedProvider::Codex, false));
+}
+
+#[cfg(test)]
+#[test]
+fn usage_row_toggles_stay_inside_one_provider() {
+    let before = sample_snapshot();
+    let hidden = effects_for(
+        &Change::Pure(SettingsCommand::SetUsageRowShown(
+            UsageRow::CursorAuto,
+            false,
+        )),
+        &before,
+        facts(false, true),
+    );
+    assert!(hidden.after.codex_session);
+    assert!(hidden.after.codex_weekly);
+    assert!(!hidden.after.cursor_auto);
+    assert!(hidden.after.cursor_api);
+    assert!(hidden.effects.render);
+
+    let refused = effects_for(
+        &Change::Pure(SettingsCommand::SetUsageRowShown(UsageRow::CursorApi, false)),
+        &hidden.after,
+        facts(false, true),
+    );
+    assert!(refused.effects.is_empty());
+    assert!(refused.after.cursor_api);
+
+    let mut cursor_off = sample_snapshot();
+    cursor_off.cursor = false;
+    cursor_off.cursor_auto = false;
+    cursor_off.cursor_api = false;
+    let enabled = effects_for(
+        &Change::Pure(SettingsCommand::SetProviderShown(
+            FocusedProvider::Cursor,
+            true,
+        )),
+        &cursor_off,
+        facts(false, true),
+    );
+    assert!(enabled.after.cursor);
+    assert!(enabled.after.cursor_auto);
+    assert!(!enabled.after.cursor_api);
 }
 
 #[cfg(test)]
