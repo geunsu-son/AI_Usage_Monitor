@@ -7,8 +7,6 @@
 
 Windows taskbar widget that shows **remaining** Codex and optional Cursor quota (session and weekly windows).
 
-![AI Usage Monitor running in the Windows taskbar](.github/animation.gif)
-
 ## Credits / reference repositories
 
 This project was built with reference to the open-source projects below. Full notices and licenses are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
