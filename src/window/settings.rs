@@ -697,7 +697,8 @@ fn effects_for_command(
             after.alert = *threshold;
             effects.save = true;
             // Changing the percent only updates the threshold. Already-sent
-            // keys stay until Off clears them or the next resets_at window.
+            // keys stay until Off clears them or remaining recovers above
+            // the threshold after a real quota reset.
             if *threshold == AlertThreshold::Off {
                 effects.clear_notified = true;
             }

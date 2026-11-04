@@ -818,6 +818,29 @@ fn append_provider_alerts(
     }
 }
 
+/// Stable id for one provider quota window. Legacy keys appended
+/// `:{resets_at_unix}` or `:unknown`; those still count as the same window.
+fn quota_alert_window_id(provider_key: &str, window_key: &str) -> String {
+    format!("{provider_key}:{window_key}")
+}
+
+fn notified_covers_quota_window(notified: &BTreeSet<String>, window_id: &str) -> bool {
+    let legacy_prefix = format!("{window_id}:");
+    notified
+        .iter()
+        .any(|existing| existing == window_id || existing.starts_with(&legacy_prefix))
+}
+
+fn clear_quota_window_notified(notified: &mut BTreeSet<String>, window_id: &str) {
+    let legacy_prefix = format!("{window_id}:");
+    notified.retain(|existing| existing != window_id && !existing.starts_with(&legacy_prefix));
+}
+
+fn mark_quota_window_notified(notified: &mut BTreeSet<String>, window_id: String) {
+    clear_quota_window_notified(notified, &window_id);
+    notified.insert(window_id);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn append_quota_alert(
     alerts: &mut Vec<QuotaAlert>,
@@ -831,19 +854,21 @@ fn append_quota_alert(
     window_label: &str,
     section: &crate::models::UsageSection,
 ) {
-    let prefix = format!("{provider_key}:{window_key}:");
-    let reset_key = section
-        .resets_at
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|value| value.as_secs().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let key = format!("{prefix}{reset_key}");
-    notified.retain(|existing| !existing.starts_with(&prefix) || existing == &key);
-
+    let window_id = quota_alert_window_id(provider_key, window_key);
     let remaining = poller::remaining_percentage(section.percentage).round() as u8;
-    if remaining > threshold || !notified.insert(key) {
+
+    // Codex/Cursor reset timestamps can drift within the same period. Alert once
+    // while remaining stays at/under the threshold; clear only after recovery
+    // (typical after a real quota reset), so the next drop can notify again.
+    if remaining > threshold {
+        clear_quota_window_notified(notified, &window_id);
         return;
     }
+    if notified_covers_quota_window(notified, &window_id) {
+        mark_quota_window_notified(notified, window_id);
+        return;
+    }
+    mark_quota_window_notified(notified, window_id);
 
     let reset = format_precise_reset_time(section.resets_at);
     let (title, message) = if language == LanguageId::Korean {
@@ -3047,7 +3072,7 @@ fn complete_provider_poll(
     attempt: provider_poll::Attempt,
 ) {
     let hwnd = send_hwnd.to_hwnd();
-    let (alerts, auth_notice) = {
+    let (alerts, auth_notice, notified_changed) = {
         let mut state = lock_state();
         let Some(s) = state.as_mut() else {
             return;
@@ -3076,7 +3101,9 @@ fn complete_provider_poll(
                 _ => fresh.cursor = data,
             }
         }
+        let notified_before = s.notified_quota_windows.clone();
         let alerts = collect_low_quota_alerts(s, &fresh);
+        let notified_changed = notified_before != s.notified_quota_windows;
         let cached = s.monitor.cached();
         for (usage, session, weekly) in [
             (
@@ -3119,12 +3146,12 @@ fn complete_provider_poll(
                 ),
             }
         });
-        (alerts, notice)
+        (alerts, notice, notified_changed)
     };
     for alert in &alerts {
         tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
     }
-    if !alerts.is_empty() {
+    if !alerts.is_empty() || notified_changed {
         save_state_settings();
     }
     if let Some((kind, title, body)) = auth_notice {
@@ -3837,6 +3864,7 @@ unsafe extern "system" fn wnd_proc(
 enum MenuChoice {
     Setting(settings::SettingsCommand),
     OpenSettings,
+    Refresh,
     VersionAction,
     Exit,
 }
@@ -3995,6 +4023,7 @@ fn show_context_menu(hwnd: HWND) {
     match menu.track(hwnd) {
         Some(MenuChoice::Setting(command)) => settings::apply(hwnd, command),
         Some(MenuChoice::OpenSettings) => settings_dialog::open(hwnd),
+        Some(MenuChoice::Refresh) => request_poll(SendHwnd::from_hwnd(hwnd), true),
         Some(MenuChoice::VersionAction) => run_version_action(hwnd),
         Some(MenuChoice::Exit) => exit_app(),
         None => {}
@@ -4013,6 +4042,7 @@ fn build_context_menu(
     let language = view.language;
 
     menu.item("Open Settings", false, true, MenuChoice::OpenSettings);
+    menu.item(strings.refresh, false, true, MenuChoice::Refresh);
     menu.submenu(strings.language, |menu| {
         menu.item(
             strings.system_default,
@@ -4809,7 +4839,7 @@ mod tests {
     }
 
     #[test]
-    fn low_quota_alert_is_deduplicated_until_reset_window_changes() {
+    fn low_quota_alert_is_deduplicated_until_remaining_recovers() {
         let mut alerts = Vec::new();
         let mut notified = BTreeSet::new();
         let first_reset = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
@@ -4826,8 +4856,8 @@ mod tests {
             tray_icon::TrayIconKind::Codex,
             "codex",
             "Codex",
-            "session",
-            "5시간",
+            "weekly",
+            "7일",
             &first,
         );
         append_quota_alert(
@@ -4838,14 +4868,19 @@ mod tests {
             tray_icon::TrayIconKind::Codex,
             "codex",
             "Codex",
-            "session",
-            "5시간",
+            "weekly",
+            "7일",
             &first,
         );
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("15%"));
+        assert_eq!(
+            notified.iter().collect::<Vec<_>>(),
+            vec!["codex:weekly"]
+        );
 
-        let next = crate::models::UsageSection {
+        // Drifted resets_at in the same low period must not re-alert.
+        let drifted = crate::models::UsageSection {
             percentage: 90.0,
             resets_at: Some(first_reset + Duration::from_secs(18_000)),
         };
@@ -4857,11 +4892,70 @@ mod tests {
             tray_icon::TrayIconKind::Codex,
             "codex",
             "Codex",
-            "session",
-            "5시간",
-            &next,
+            "weekly",
+            "7일",
+            &drifted,
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(notified.len(), 1);
+
+        // Legacy timestamped keys also suppress a second alert.
+        notified.clear();
+        notified.insert("codex:weekly:1794236468".into());
+        append_quota_alert(
+            &mut alerts,
+            &mut notified,
+            20,
+            LanguageId::Korean,
+            tray_icon::TrayIconKind::Codex,
+            "codex",
+            "Codex",
+            "weekly",
+            "7일",
+            &drifted,
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(
+            notified.iter().collect::<Vec<_>>(),
+            vec!["codex:weekly"]
+        );
+
+        // After quota recovers above the threshold, the next drop may alert again.
+        let recovered = crate::models::UsageSection {
+            percentage: 10.0,
+            resets_at: Some(first_reset + Duration::from_secs(604_800)),
+        };
+        append_quota_alert(
+            &mut alerts,
+            &mut notified,
+            20,
+            LanguageId::Korean,
+            tray_icon::TrayIconKind::Codex,
+            "codex",
+            "Codex",
+            "weekly",
+            "7일",
+            &recovered,
+        );
+        assert!(notified.is_empty());
+
+        let after_reset = crate::models::UsageSection {
+            percentage: 88.0,
+            resets_at: Some(first_reset + Duration::from_secs(604_800)),
+        };
+        append_quota_alert(
+            &mut alerts,
+            &mut notified,
+            20,
+            LanguageId::Korean,
+            tray_icon::TrayIconKind::Codex,
+            "codex",
+            "Codex",
+            "weekly",
+            "7일",
+            &after_reset,
         );
         assert_eq!(alerts.len(), 2);
-        assert_eq!(notified.len(), 1);
+        assert!(alerts[1].message.contains("12%"));
     }
 }
